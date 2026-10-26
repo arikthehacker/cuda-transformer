@@ -1,5 +1,6 @@
 # Training data: personal writing and downloaded texts stay local
 data/
+my_writing/
 sources.local.txt
 
 # Build output

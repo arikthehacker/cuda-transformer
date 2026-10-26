@@ -1,12 +1,13 @@
 """Build the training text.
 
 Writes one clean text file per source to data/clean/:
-  bible.txt and austen.txt (downloaded), plus one file per section
-  of sources.local.txt (your own writing, kept out of git).
+  bible.txt and austen.txt (downloaded), one file per folder in my_writing/,
+  and one file per section of sources.local.txt (your own writing, kept out of git).
 
 Raw downloads are cached in data/raw/ so re-running is fast.
-Run:  python prepare_data.py
+Run:  python prepare_data.py            (--no-public leaves out the Bible and Austen)
 """
+import argparse
 import gzip
 import hashlib
 import html
@@ -17,12 +18,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from pypdf import PdfReader
-
 ROOT = Path(__file__).parent
 RAW = ROOT / "data" / "raw"
 CLEAN = ROOT / "data" / "clean"
 LOCAL_SOURCES = ROOT / "sources.local.txt"
+MY_WRITING = ROOT / "my_writing"
+LOOSE_FILES_TAG = "mine"
+PUBLIC = ("bible", "austen")
+FILE_TYPES = (".pdf", ".docx", ".txt", ".md")
 
 BSB_URL = "https://bereanbible.com/bsb.txt"  # Berean Standard Bible, public domain
 GUTENBERG_URL = "https://www.gutenberg.org/cache/epub/{id}/pg{id}.txt"
@@ -185,6 +188,8 @@ def austen():
 # ---------- local files ----------
 
 def pdf_text(path):
+    from pypdf import PdfReader
+
     reader = PdfReader(str(path))
     raw = "\n".join(page.extract_text() or "" for page in reader.pages)
     return reflow(raw)
@@ -234,6 +239,10 @@ def file_text(path):
     if ext in (".txt", ".md"):
         return path.read_text(encoding="utf-8", errors="ignore")
     return None
+
+
+def tag_name(name):
+    return re.sub(r"_+", "_", re.sub(r"[^a-z]", "_", name.lower())).strip("_")
 
 
 def expand(entry):
@@ -289,7 +298,6 @@ def read_local_sources():
     """Parse sources.local.txt into {section: (entries, skip_names)}."""
     sections = {}
     if not LOCAL_SOURCES.exists():
-        print(f"no {LOCAL_SOURCES.name}, so only public sources are used\n")
         return sections
     current = None
     for line in LOCAL_SOURCES.read_text(encoding="utf-8").splitlines():
@@ -297,14 +305,33 @@ def read_local_sources():
         if not line or line.startswith("#"):
             continue
         if line.startswith("[") and line.endswith("]"):
-            current = line[1:-1].strip()
-            sections[current] = ([], set())
+            current = tag_name(line[1:-1])
+            sections.setdefault(current, ([], set()))
         elif current is None:
             raise SystemExit(f"{LOCAL_SOURCES.name}: '{line}' is outside a [section]")
         elif line.startswith("!"):
             sections[current][1].add(line[1:].strip())
         else:
             sections[current][0].append(line)
+    return sections
+
+
+def my_writing_sections():
+    sections = {}
+    if not MY_WRITING.is_dir():
+        return sections
+    for path in sorted(MY_WRITING.iterdir()):
+        if path.is_dir():
+            sections.setdefault(tag_name(path.name), []).append(str(path))
+        elif path.suffix.lower() in FILE_TYPES:
+            sections.setdefault(LOOSE_FILES_TAG, []).append(str(path))
+    return {name: entries for name, entries in sections.items() if name}
+
+
+def local_sources():
+    sections = read_local_sources()
+    for name, entries in my_writing_sections().items():
+        sections.setdefault(name, ([], set()))[0].extend(entries)
     return sections
 
 
@@ -349,16 +376,33 @@ def write(name, text):
 
 
 def main():
+    p = argparse.ArgumentParser(description="Build data/clean/ from the public texts and your own writing.")
+    p.add_argument("--no-public", action="store_true", help="leave out the Bible and Austen, use only your writing")
+    args = p.parse_args()
+
     RAW.mkdir(parents=True, exist_ok=True)
     CLEAN.mkdir(parents=True, exist_ok=True)
     for old in CLEAN.glob("*.txt"):  # drop sources removed from the config
         old.unlink()
-    for name, build in (("bible", bible), ("austen", austen)):
+    local = local_sources()
+    clash = [name for name in local if name in PUBLIC and not args.no_public]
+    if clash:
+        raise SystemExit(f"{', '.join(clash)} is already a public source, so rename that folder or section")
+    if args.no_public and not local:
+        raise SystemExit("--no-public needs your own writing: put files in my_writing/ or list them in sources.local.txt")
+    if not local:
+        print("no my_writing/ folder or sources.local.txt, so only public sources are used\n")
+    if not args.no_public:
+        for name, build in (("bible", bible), ("austen", austen)):
+            print(f"{name}...")
+            write(name, build())
+    for name, (entries, skip) in local.items():
         print(f"{name}...")
-        write(name, build())
-    for name, (entries, skip) in read_local_sources().items():
-        print(f"{name}...")
-        write(name, local_section(entries, skip))
+        text = local_section(entries, skip)
+        if text:
+            write(name, text)
+        else:
+            print("  nothing readable, skipped\n")
 
 
 if __name__ == "__main__":

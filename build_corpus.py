@@ -18,7 +18,7 @@ CLEAN = ROOT / "data" / "clean"
 
 # How many times each source appears in the training file.
 REPEATS = {"bible": 1, "austen": 1}
-LOCAL_REPEATS = 4  # for every source from sources.local.txt
+LOCAL_REPEATS = 4  # for each of your own sources, when the public texts are in too
 CHUNK_CHARS = 1000  # paragraphs are grouped into chunks of about this size
 VAL_FRACTION = 0.1
 
@@ -40,8 +40,10 @@ def main():
     rng = random.Random(42)
     train, val = [], []
     local = sorted(p.stem for p in CLEAN.glob("*.txt") if p.stem not in REPEATS)
-    for name in list(REPEATS) + local:
-        reps = REPEATS.get(name, LOCAL_REPEATS)
+    public = [name for name in REPEATS if (CLEAN / f"{name}.txt").exists()]
+    local_reps = LOCAL_REPEATS if public else 1
+    for name in public + local:
+        reps = REPEATS.get(name, local_reps)
         path = CLEAN / f"{name}.txt"
         text = path.read_text(encoding="utf-8").strip() if path.exists() else ""
         if not text:
