@@ -1,0 +1,27 @@
+# Training data: personal writing and downloaded texts stay local
+data/
+sources.local.txt
+
+# Build output
+build/
+*.o
+*.obj
+*.exe
+*.out
+*.bin
+*.ckpt
+
+# Profiler reports
+*.nsys-rep
+*.ncu-rep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
