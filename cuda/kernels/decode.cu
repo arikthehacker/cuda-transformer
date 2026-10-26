@@ -601,6 +601,32 @@ void sample_token(DecodeState *st, int *history, const TL *logits, const float *
 
 template void sample_token<float>(DecodeState *, int *, const float *, const float *, int, SampleConfig, int,
                                   cudaStream_t);
+
+__global__ void push_kernel(DecodeState *st, int *history, int token, int set_pos)
+{
+    history[st->n] = token;
+    st->n++;
+    st->token = token;
+    st->pos = set_pos >= 0 ? set_pos : st->pos + 1;
+}
+
+__global__ void replace_kernel(DecodeState *st, int *history, int token)
+{
+    history[st->n - 1] = token;
+    st->token = token;
+}
+
+void push_token(DecodeState *st, int *history, int token, int set_pos, cudaStream_t s)
+{
+    push_kernel<<<1, 1, 0, s>>>(st, history, token, set_pos);
+    CUDA_CHECK_LAUNCH();
+}
+
+void replace_token(DecodeState *st, int *history, int token, cudaStream_t s)
+{
+    replace_kernel<<<1, 1, 0, s>>>(st, history, token);
+    CUDA_CHECK_LAUNCH();
+}
 #ifdef FP16
 template void sample_token<__half>(DecodeState *, int *, const __half *, const float *, int, SampleConfig, int,
                                    cudaStream_t);

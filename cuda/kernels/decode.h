@@ -69,5 +69,13 @@ template <class TL>
 void sample_token(DecodeState *st, int *history, const TL *logits, const float *rand, int V, SampleConfig sc,
                   int set_pos, cudaStream_t s);
 
+// Chat: a token the host already knows (the user's words) instead of a draw.
+// history[st->n] = token, n goes up by one, token becomes the pending token,
+// pos becomes set_pos (after a prefill) or pos + 1. sampled does not move.
+void push_token(DecodeState *st, int *history, int token, int set_pos, cudaStream_t s);
+// Swap the pending token (the last one in the history) for another, e.g. a
+// stop tag the model wrote for the <user> that has to follow an answer.
+void replace_token(DecodeState *st, int *history, int token, cudaStream_t s);
+
 // the host version of the same draw, for the tests
 int sample_host(const float *logits, int V, SampleConfig sc, float u);

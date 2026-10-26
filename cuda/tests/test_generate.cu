@@ -9,6 +9,10 @@
 //     before and after the cache rolls over
 //  3. the CUDA Graph replay gives the same tokens as launching the kernels
 //  4. a seed reproduces a sample, and no-cache decoding agrees (fp32 build)
+//  5. chat: tokens fed one decode step each give what a prefill gives, an
+//     answer stops at a tag and leaves <user> in place, and a conversation
+//     kept in the cache over many turns (past rollovers and a history
+//     compaction) answers exactly like the same conversation fed at once
 // The weights are the dump's (any weights work: nothing here needs training).
 
 #include <algorithm>
@@ -262,6 +266,108 @@ static void mode_checks(Generator &gen, const vector<int> &prompt)
            before / (ms_full / 1000.0));
 }
 
+// ---------------------------------------------------------------- 5. chat
+
+static DecodeState decode_state(Generator &gen)
+{
+    DecodeState st;
+    CUDA_CHECK(cudaMemcpy(&st, gen.state.ptr, sizeof(st), cudaMemcpyDeviceToHost));
+    return st;
+}
+
+static int history_at(Generator &gen, int i)
+{
+    int v = 0;
+    CUDA_CHECK(cudaMemcpy(&v, gen.history.ptr + i, sizeof(int), cudaMemcpyDeviceToHost));
+    return v;
+}
+
+static vector<int> random_tokens(int n, int V, unsigned seed)
+{
+    mt19937 rng(seed);
+    vector<int> t(n);
+    for (int &x : t)
+    {
+        x = static_cast<int>(rng() % 50 == 0 ? rng() % V : rng() % 60);
+    }
+    return t;
+}
+
+static void chat_checks(Generator &gen)
+{
+    const ModelConfig &cfg = gen.cfg;
+    int V = cfg.V, T = cfg.n_ctx;
+    const int MAXN = 40;
+    int next = V - 1;                       // stands in for <user>
+    SampleConfig greedy = {0.0f, 0};
+    auto quiet = [](int) {};
+    printf("\nchat: one conversation kept in the cache across turns\n");
+
+    // a. a prompt fed one decode step per token continues like a prefilled prompt
+    vector<int> p = random_tokens(T / 2, V, 1);
+    vector<int> want = gen.generate(p, 10, greedy, 1, Generator::Mode::Cached);
+    gen.chat_start(MAXN, 1);
+    gen.chat_feed(p);
+    vector<int> got = gen.chat_answer(10, greedy, V, next, Generator::Mode::Cached, quiet);
+    int agree = 0;
+    while (agree < 10 && got[agree] == want[p.size() + agree])
+    {
+        agree++;
+    }
+#ifdef FP16
+    printf("  fed one step at a time vs prefilled, greedy: the first %d of 10 tokens agree (the prefill's\n"
+           "  fp16 logits round differently from the decode GEMV's, so a near tie can go the other way)\n", agree);
+#else
+    check(agree == 10, "a prompt fed one decode step per token continues like a prefill (" + to_string(agree) +
+                           " of 10)");
+#endif
+
+    // b. any token >= stop_from ends the answer, and next takes its place
+    gen.chat_start(MAXN, 2);
+    gen.chat_feed(p);
+    int seen = 0;
+    vector<int> one = gen.chat_answer(5, {0.8f, 40}, 0, next, Generator::Mode::CachedGraph, [&](int) { seen++; });
+    DecodeState st = decode_state(gen);
+    check(one.size() == 1 && seen == 1, "the first tag ends the answer, and on_token saw it");
+    check(st.token == next && history_at(gen, st.n - 1) == next, "the tag is swapped for <user>, the pending token");
+
+    // c. an answer that runs out gets "\n" and next fed after it
+    gen.chat_start(MAXN, 3);
+    gen.chat_feed(p);
+    DecodeState before = decode_state(gen);
+    vector<int> three = gen.chat_answer(3, greedy, V, next, Generator::Mode::Cached, quiet);
+    st = decode_state(gen);
+    check(three.size() == 3 && st.n == before.n + 5 && st.token == next && history_at(gen, st.n - 2) == '\n',
+          "an answer that runs out ends with \"\\n\" and <user> fed after it");
+
+    // d. many turns in the cache against the whole conversation fed at once
+    const int TURNS = 8, ANSWER = 25;
+    gen.chat_start(MAXN, 4);
+    vector<int> all, last_answer;
+    for (int k = 0; k < TURNS; k++)
+    {
+        vector<int> q = random_tokens(13 + 3 * (k % 3), V, 10 + k);
+        gen.chat_feed(q);
+        all.insert(all.end(), q.begin(), q.end());
+        if (k == TURNS - 1)
+        {
+            break;
+        }
+        vector<int> a = gen.chat_answer(ANSWER, greedy, V, next, Generator::Mode::CachedGraph, quiet);
+        all.insert(all.end(), a.begin(), a.end());
+        all.push_back('\n');
+        all.push_back(next);
+    }
+    last_answer = gen.chat_answer(ANSWER, greedy, V, next, Generator::Mode::CachedGraph, quiet);
+    int length = gen.chat_length();
+    gen.chat_start(MAXN, 5);
+    gen.chat_feed(all);
+    vector<int> at_once = gen.chat_answer(ANSWER, greedy, V, next, Generator::Mode::CachedGraph, quiet);
+    check(length > 4 * T + MAXN + 2, "the conversation (" + to_string(length) + " tokens) outgrew the history " +
+                                         "buffer, so it was compacted, and rolled the cache over");
+    check(at_once == last_answer, "turn by turn in the cache answers exactly like the whole conversation at once");
+}
+
 int main(int argc, char *argv[])
 {
     string path = argc > 1 ? argv[1] : "data/ref/debug.bin";
@@ -274,6 +380,7 @@ int main(int argc, char *argv[])
     vector<int> prompt = {cfg.V - 1, 10};   // the last id is a tag in a real tokenizer, then "\n"
     cache_checks(gen, prompt);
     mode_checks(gen, prompt);
+    chat_checks(gen);
     printf("\n%s\n", g_failed == 0 ? "generation matches" : (to_string(g_failed) + " check(s) failed").c_str());
     return g_failed == 0 ? 0 : 1;
 }

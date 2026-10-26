@@ -3,6 +3,17 @@
 //   ./build/generate -w data/ref/weights.bin -t bible -n 300 -T 0.8 -k 40 -s 1
 //   ./build/generate -t bible,austen -s 1,2          every pair, like reference/sample.py
 //   ./build/generate -b                              tokens per second: graph, plain launches, no cache
+//   ./build/generate -w data/chat/sft/weights.bin -m data/chat/tokenizer.bpe --chat
+//                                                    a conversation: one line in, one answer out
+//
+// --chat reads one message per line from stdin (an empty line or the end of
+// input stops) and keeps the whole conversation in the KV cache. Each
+// message goes in as "<user>\n" + line + "\n<assistant>\n", one decode step
+// per token; then the answer is sampled until the model writes a tag, and
+// printed as it comes. After each answer stdout gets a line holding only
+// "\x1e" (the ASCII record separator), so a program reading the pipe knows
+// where an answer ends. Everything else (the banner, the "you>" prompt) goes
+// to stderr.
 //
 // The weights can come from PyTorch (reference/export.py) or from
 // train_fast. Only a model trained on the public sources goes anywhere public.
@@ -11,6 +22,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -35,6 +48,7 @@ static void usage(const char *prog)
     printf("  -s seeds      seed(s), comma separated (default 1)\n");
     printf("  -c mode       graph (KV cache + CUDA Graph), plain (KV cache), nocache (default graph)\n");
     printf("  -K            keep going past the next tag (by default a sample ends where a new chunk would start)\n");
+    printf("  --chat        a conversation on stdin / stdout (the stage 6 chat model); -n caps each answer\n");
     printf("  -b            benchmark the three modes instead of printing text\n");
     printf("  -o file       with -b: also write the table as markdown (bench/results.py reads it)\n");
     printf("  -h            print this help message\n");
@@ -77,6 +91,108 @@ static int tag_id(const Tokenizer &tok, string tag)
     exit(1);
 }
 
+// The tag id of name, or -1
+static int find_tag(const Tokenizer &tok, const string &name)
+{
+    for (size_t k = 0; k < tok.specials.size(); k++)
+    {
+        if (tok.specials[k] == name)
+        {
+            return 256 + static_cast<int>(tok.merges.size() + k);
+        }
+    }
+    return -1;
+}
+
+// What prepare_chat.py does to every line of training text, for one line typed in
+static string clean_line(string line)
+{
+    string out;
+    for (char c : line)
+    {
+        if (c != '\r' && c != '\x1e')
+        {
+            out += c;
+        }
+    }
+    size_t end = out.find_last_not_of(" \t");
+    out = end == string::npos ? "" : out.substr(0, end + 1);
+    static const regex tag_line("^<[a-z_]+>$");
+    if (regex_match(out, tag_line))
+    {
+        out = " " + out;                    // a line like "<div>" would become a tag: keep it text
+    }
+    return out;
+}
+
+static int chat(Generator &gen, Tokenizer &tok, int max_new, SampleConfig sc, unsigned long long seed,
+                Generator::Mode mode)
+{
+    int user = find_tag(tok, "<user>"), assistant = find_tag(tok, "<assistant>");
+    if (user < 0 || assistant < 0)
+    {
+        fprintf(stderr, "error: this tokenizer has no <user> and <assistant> tags, so --chat needs the stage 6 chat "
+                        "model (data/chat/tokenizer.bpe)\n");
+        return 1;
+    }
+    int first_tag = 256 + static_cast<int>(tok.merges.size());
+    int longest = 2 * gen.cfg.n_ctx;        // a longer message keeps its last part
+    gen.chat_start(max_new, seed);
+    fprintf(stderr, "chat: one message per line, an empty line ends. Each answer ends with a line holding only \\x1e.\n");
+    string line;
+    bool started = false;
+    fprintf(stderr, "you> ");
+    while (getline(cin, line))
+    {
+        line = clean_line(line);
+        if (line.empty())
+        {
+            break;
+        }
+        vector<uint32_t> ids = encode(tok, "<user>\n" + line + "\n<assistant>\n");   // ids[0] is <user>
+        vector<int> feed;
+        if (!started)                       // after an answer the <user> tag is already in place
+        {
+            feed.push_back(user);
+        }
+        size_t body = 1;
+        if (ids.size() - 1 > static_cast<size_t>(longest))
+        {
+            fprintf(stderr, "(the message is %zu tokens, only its last %d go in)\n", ids.size() - 1, longest);
+            body = ids.size() - longest;
+            feed.push_back('\n');          // still a newline after the tag, like every turn
+        }
+        feed.insert(feed.end(), ids.begin() + body, ids.end());
+        gen.chat_feed(feed);
+        started = true;
+
+        string held;                        // newlines at the end of what came so far: printed only if more text follows
+        gen.chat_answer(max_new, sc, first_tag, user, mode, [&](int t)
+                        {
+                            if (t >= first_tag)
+                            {
+                                return;
+                            }
+                            const string &b = tok.vocab[t];
+                            size_t end = b.find_last_not_of('\n');
+                            if (end == string::npos)
+                            {
+                                held += b;
+                                return;
+                            }
+                            fwrite(held.data(), 1, held.size(), stdout);
+                            fwrite(b.data(), 1, end + 1, stdout);
+                            held = b.substr(end + 1);
+                            fflush(stdout);
+                        });
+        printf("\n\x1e\n");
+        fflush(stdout);
+        fprintf(stderr, "you> ");
+    }
+    fprintf(stderr, "\n");
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     string weights_path = "data/ref/weights.bin";
@@ -85,13 +201,21 @@ int main(int argc, char *argv[])
     int max_new = 300;
     SampleConfig sc = {0.8f, 40};
     Generator::Mode mode = Generator::Mode::CachedGraph;
-    bool keep_going = false, bench = false;
+    bool keep_going = false, bench = false, chat_mode = false;
     string md_path;
+    static const option long_opts[] = {
+        {"chat", no_argument, nullptr, 1000},
+        {"help", no_argument, nullptr, 'h'},
+        {nullptr, 0, nullptr, 0},
+    };
     int opt = 0;
-    while ((opt = getopt(argc, argv, "w:m:t:n:T:k:s:c:Kbo:h")) != -1)
+    while ((opt = getopt_long(argc, argv, "w:m:t:n:T:k:s:c:Kbo:h", long_opts, nullptr)) != -1)
     {
         switch (opt)
         {
+        case 1000:
+            chat_mode = true;
+            break;
         case 'w':
             weights_path = optarg;
             break;
@@ -169,9 +293,18 @@ int main(int argc, char *argv[])
         return 1;
     }
     Generator gen(w.cfg, w.params);
-    printf("%s: %s parameters, L %d H %d C %d n_ctx %d, %s\n\n", weights_path.c_str(),
-           with_commas(static_cast<long long>(w.params.size())).c_str(), w.cfg.L, w.cfg.H, w.cfg.C, w.cfg.n_ctx,
-           FLOATX_NAME);
+    fprintf(chat_mode ? stderr : stdout, "%s: %s parameters, L %d H %d C %d n_ctx %d, %s\n\n", weights_path.c_str(),
+            with_commas(static_cast<long long>(w.params.size())).c_str(), w.cfg.L, w.cfg.H, w.cfg.C, w.cfg.n_ctx,
+            FLOATX_NAME);
+    if (chat_mode)
+    {
+        if (mode == Generator::Mode::NoCache)
+        {
+            fprintf(stderr, "error: --chat keeps the conversation in the cache, so -c nocache does not apply\n");
+            return 1;
+        }
+        return chat(gen, tok, max_new, sc, strtoull(split(seeds).at(0).c_str(), nullptr, 10), mode);
+    }
 
     if (bench)
     {
