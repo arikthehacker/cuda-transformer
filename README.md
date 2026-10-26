@@ -16,20 +16,36 @@ can add your own writing to it.
 ```
 git clone https://github.com/arikthehacker/cuda-transformer.git
 cd cuda-transformer
-pip install pypdf
-python prepare_data.py
-python build_corpus.py
+sudo apt-get install -y build-essential python3-pypdf
+python3 prepare_data.py
+python3 build_corpus.py
+make run
 ```
 
-expected output (from `build_corpus.py`):
+The two Python scripts download the training text and write it to
+`data/corpus_train.txt` and `data/corpus_val.txt`. `make run` builds the tokenizer,
+which is the program that turns text into the numbers the model reads. It trains the
+tokenizer on `corpus_train.txt`, then turns both text files into token files.
+
+expected output (from `make run`, the times change from run to run):
 
 ```
-bible         4341 chunks  x1 in train
-austen        4536 chunks  x1 in train
-data/corpus_train.txt: 7,330,232 chars
-data/corpus_val.txt: 796,034 chars
-distinct characters: 93
+./build/bpe -t -i data/corpus_train.txt -n 4096 -o data/tokenizer.bpe -v
+words  29,844 unique of 1,709,937 pieces, 1,142 pairs, 0.09 s
+merge   256 / 4096   (32, 116)    -> 256     " t"           count 181,309
+merge   512 / 4096   (108, 97)    -> 512     "la"           count 3,054
+...
+merge  4095 / 4096   (2520, 554)  -> 4095    " Perry"       count 76
+merges 3840, specials 2 (<bible> <austen>), vocab 4098, 0.15 s -> data/tokenizer.bpe
+./build/bpe -e -m data/tokenizer.bpe -i data/corpus_train.txt -o data/train.bin
+tokens written 2,027,109, chars per token 3.62 (bytes per token 3.66), 0.13 s -> data/train.bin
+./build/bpe -e -m data/tokenizer.bpe -i data/corpus_val.txt -o data/val.bin
+tokens written 224,728, chars per token 3.54 (bytes per token 3.57), 0.02 s -> data/val.bin
 ```
+
+`make test` runs the tokenizer's checks. `make DEBUG=1 test` runs them again with the
+compiler's address and undefined behavior sanitizers turned on, which stop the program
+at the first out of bounds memory access or undefined operation.
 
 ## options
 
@@ -49,7 +65,24 @@ Wattpad account:
 `sources.local.txt` and everything under `data/` are listed in `.gitignore`, so your
 writing never gets committed.
 
+The tokenizer is a command line tool. Running `./build/bpe -h`:
+
+```
+Usage: ./build/bpe [-t|-e|-d] [OPTIONS ...]
+  -t            train a tokenizer on -i, save it to -o
+  -e            encode -i with tokenizer -m, write token ids to -o
+  -d            decode token file -i with tokenizer -m, print the text
+  -i file       input file
+  -o file       output file
+  -m file       tokenizer file (for -e and -d)
+  -n #          vocab size: bytes + merges (default 4096)
+  -v            verbose: print every 256th merge while training
+  -h            print this help message
+```
+
 ## how it works
+
+### training text
 
 `prepare_data.py` writes one clean text file per source into `data/clean/`. Both public
 sources are downloaded once and saved in `data/raw/`. The Bible comes from
@@ -105,15 +138,53 @@ train += tagged[:cut] * reps
 val += tagged[cut:]
 ```
 
+### tokenizer
+
+The tokenizer in `tokenizer/bpe.cpp` uses byte pair encoding (BPE). It starts with one
+token for each of the 256 possible byte values, then repeatedly takes the pair of
+neighboring tokens that appears most often and adds it to the vocabulary as a new
+token. With `-n 4096` it learns 3,840 of these merges. Each source tag, such as
+`<bible>`, gets one token of its own and is never merged.
+
+Before training, the text is split into words, and a merge never joins two words. A
+word is a run of letters, a run of digits, or a run of punctuation, each with at most
+one leading space. For example, `Let there be light,` becomes `Let`, ` there`, ` be`,
+` light`, and `,`. Curly quotes and dashes count as punctuation, so `God’s` splits the
+same way `God's` does.
+
+Training works on the 29,844 unique words and how often each appears, instead of the
+1.7 million words in the text. A count is kept for every pair, along with the list of
+words that contain it, and a heap keeps the most frequent pair on top. After a merge,
+only the words in that pair's list are rewritten, and only the counts of the pairs next
+to each merged spot change. Outdated heap entries are skipped when they reach the top:
+
+```cpp
+while (tok.merges.size() < num_merges && pop_best(heap, st.counts, best))
+{
+    ...
+    vector<uint32_t> list = move(st.where[best.key]);
+    st.where.erase(best.key);
+
+    st.touched.clear();
+    for (uint32_t wi : list)
+        merge_word(words[wi], a, b, c, wi, st);
+    ...
+}
+```
+
+Encoding splits the text into words the same way and remembers the tokens of every word
+it has already encoded, so each unique word is worked out once.
+
+`tests/test_bpe.cpp` checks the trainer against a slow version that recounts every pair
+after every merge. Both have to learn the same merges on 400 random texts and on 100 KB
+of the real validation text. The tests also check that decoding gives back the exact
+bytes that went in, for emoji, Windows line endings, and bytes that are not valid
+UTF-8.
+
 ## plan
 
-The data scripts above are written. The rest is built in this order:
+The data scripts and the tokenizer are written. The rest is built in this order:
 
-1. **Tokenizer, in C++.** The tokenizer turns text into a list of numbers the model can
-   read. It uses byte pair encoding (BPE), which starts from single
-   characters and repeatedly merges the pair of neighboring pieces that appears most
-   often into one new piece. A priority queue keeps the most frequent pair on top, so
-   the pair counts don't have to be recomputed after every merge.
 2. **PyTorch reference model.** A small version of the same model in PyTorch. It saves
    its weights, its intermediate values, and its gradients (how much each weight
    should change during training) to files, so the CUDA code can be compared against
