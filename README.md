@@ -47,6 +47,61 @@ tokens written 216,395, chars per token 3.68 (bytes per token 3.71), 0.01 s -> d
 compiler's address and undefined behavior sanitizers turned on, which stop the program
 at the first out of bounds memory access or undefined operation.
 
+The reference model is written in PyTorch and trains on an NVIDIA GPU. Ubuntu does not
+let `pip` install packages for the whole system, so PyTorch goes in a virtual
+environment:
+
+```
+python3 -m venv .venv
+. .venv/bin/activate
+pip install torch numpy pytest
+python -m pytest reference
+python -m reference.train
+python -m reference.sample --tag bible austen
+```
+
+expected output (from `python -m reference.train`):
+
+```
+model  12,343,296 parameters | L 6 H 6 C 384 n_ctx 256 | V 4098 Vp 4160
+data   train 1,949,203 tokens | val 216,395 tokens | 4,096 tokens per step
+mode   exact (fp32, deterministic) on cuda
+step    0 | val 8.366 | ln(V) = 8.318
+step  250 | train 5.741 | val 5.030 | lr 6.0e-04 | norm 0.97 | 56,352 tok/s | mfu 41.7%
+step  500 | train 4.536 | val 4.655 | lr 5.9e-04 | norm 0.78 | 56,153 tok/s | mfu 41.6%
+...
+step 3000 | train 2.925 | val 3.818 | lr 2.6e-04 | norm 1.28 | 55,779 tok/s | mfu 41.3%
+...
+step 4000 | train 2.589 | val 3.844 | lr 1.2e-04 | norm 1.60 | 55,510 tok/s | mfu 41.1%
+val has not improved for 4 evals, stopping early
+done   best val 3.818 at step 3000 -> data/ref/best.pt
+speed  55,922 tok/s over 3990 timed steps | MFU 41.4% of 10 TFLOPS
+```
+
+Training stops on its own once the loss, the model's average error on the validation
+text, has not improved for 4 checks in a row, and `data/ref/best.pt` keeps the model
+from the best check. Then `python -m reference.sample --tag bible austen` prints a
+sample from each tag:
+
+```
+===== bible, seed 1
+<bible>
+8:16 “Woe to us, O LORD, for we have sinned to be wicked!”
+
+8:17 Restore us Your inheritance, and Your inheritance is our possession.
+
+8:18 Then we are to take away our descendants together; we will sing to our our God on the day we have not finished our land, nor our fathers have obeyed our father David.
+
+8:19 But now, therefore, please let
+
+===== austen, seed 1
+<austen>
+He was a woman whose spirit of mind might have been risen from the folly of a child; the knowledge of his own vanities, and the greater evil than the warmth of her mind.
+
+
+[the model started a new chunk: <bible>]
+```
+
 ## options
 
 To add your own writing, copy `sources.example.txt` to `sources.local.txt` and list
@@ -78,6 +133,33 @@ Usage: ./build/bpe [-t|-e|-d] [OPTIONS ...]
   -n #          vocab size: bytes + merges (default 4096)
   -v            verbose: print every 256th merge while training
   -h            print this help message
+```
+
+The reference model's scripts each take `-h`. Running `python -m reference.train -h`:
+
+```
+usage: train.py [-h] [--steps STEPS] [--batch BATCH] [--out OUT] [--fast] [--resume]
+                [--device DEVICE]
+
+Train the reference GPT. Run from the repo root.
+
+options:
+  -h, --help       show this help message and exit
+  --steps STEPS    optimizer steps (default 5000)
+  --batch BATCH    sequences per step (default 16)
+  --out OUT        folder for checkpoints and logs (default data/ref)
+  --fast           fp16 autocast + scaled_dot_product_attention
+  --resume         continue from OUT/last.pt
+  --device DEVICE  cuda or cpu (default: cuda when there is one)
+```
+
+Sampling and the answer key:
+
+```
+python -m reference.sample --tag bible austen --seed 1 2    # four samples
+python -m reference.dump                                    # tiny model -> data/ref/debug.bin
+python -m reference.dump --full                             # full size -> data/ref/debug_full.bin
+python -m reference.dump --compare data/ref/debug.bin mine.bin   # error table
 ```
 
 ## how it works
@@ -202,26 +284,67 @@ of the real validation text. The tests also check that decoding gives back the e
 bytes that went in, for emoji, Windows line endings, and bytes that are not valid
 UTF-8.
 
+### reference model
+
+`reference/` is the model written in PyTorch. Its job is to be the answer key. Every
+number the CUDA code computes later is checked against a number this model wrote to a
+file. It follows GPT-2's layout at a smaller size, with 6 layers, 6 attention heads of
+64 dimensions each, a 384 wide hidden state, and a 256 token context, for 12,343,296
+parameters. The vocabulary is padded up to a multiple of 64 (4,098 ids become 4,160), so
+every matrix divides evenly into the 64 wide blocks that GPU code works on. The padded
+ids are never sampled and their weights stay 0. The output layer reuses the token
+embedding matrix.
+
+The model runs in two modes. Exact mode uses 32-bit floats and PyTorch's deterministic
+algorithms, so the same seed gives the same numbers on every run. It writes LayerNorm
+and attention out step by step, and each step can record its output under a name:
+
+```python
+scores = (q @ k.transpose(-2, -1)) / math.sqrt(D)                    # (B, H, T, T)
+scores = scores.masked_fill(~self.mask[:T, :T], float("-inf"))      # (B, H, T, T) future = -inf
+_rec(rec, prefix + "scores", scores)
+probs = torch.softmax(scores, dim=-1)           # (B, H, T, T) subtracts each row's max first
+_rec(rec, prefix + "probs", probs)
+y = probs @ v                                   # (B, H, T, D)
+```
+
+Recording also keeps the gradient of every recorded value. A gradient says how much the
+loss changes when that value changes, and training moves each weight against its
+gradient. Fast mode uses 16-bit floats on the RTX 2080's tensor cores (hardware units
+built for small matrix multiplies) and PyTorch's fused attention. It is the speed the
+CUDA code has to beat. In a 500 step test, both modes reached the same losses to three
+decimal places. Exact mode trains at about 56,000 tokens per second, 41% of what the
+card's 32-bit cores can do at most, and fast mode at about 185,000, 34% of what the
+tensor cores can do at most.
+
+`reference/dump.py` runs a small version of the model (2 layers, 64 wide) through one
+forward pass, which makes a prediction and its loss, one backward pass, which computes
+the gradients, and one step of AdamW, the optimizer that updates the weights. It writes
+every weight, recorded value, gradient and updated weight to `data/ref/debug.bin`, 164
+tensors in 20 MB. Writing it twice gives byte-identical files. `--compare` reads two of
+these files and prints the largest error of every tensor in file order, and it marks the
+first tensor over the tolerance, because that is where a bug starts.
+
+`python -m pytest reference` runs 12 checks, including these four. A fresh model's loss
+has to be the natural log of the vocabulary size, changing a later token can never
+change an earlier prediction, the model has to be able to memorize a single batch, and
+PyTorch's `gradcheck` has to agree with the backward pass in 64-bit floats.
+
 ## plan
 
-The data scripts and the tokenizer are written. The rest is built in this order:
+The data scripts, the tokenizer and the PyTorch reference model are written. The rest
+is built in this order:
 
-2. **PyTorch reference model.** A small version of the same model in PyTorch. It saves
-   its weights, its intermediate values, and its gradients (how much each weight
-   should change during training) to files, so the CUDA code can be compared against
-   them number by number.
-3. **CUDA in 32-bit floats.** Each layer of the model gets a GPU kernel (a function
-   that runs on the graphics card) for the forward pass, which makes a prediction, and
-   one for the backward pass, which computes the gradients. Each kernel's output has to
-   match the PyTorch files from step 2.
-4. **Fast CUDA.** Matrix multiplication runs on the RTX 2080's tensor cores (hardware
-   units built for small matrix multiplies) and is written in inline PTX, NVIDIA's
-   assembly language for its GPUs. Attention runs as one combined kernel. Training uses
-   fp16, a 16-bit float format, with loss scaling, which multiplies the loss so small
-   gradients don't round to zero. Most models train in bfloat16, a different 16-bit
-   format, but the 2080 has no hardware support for it. CUDA Graphs record a whole
-   training step once and replay it, which removes the cost of launching each kernel
-   separately.
+3. **CUDA in 32-bit floats.** Each layer of the model gets a GPU kernel (a function that
+   runs on the graphics card) for its forward pass and one for its backward pass. Each
+   kernel's output has to match the reference model's dump.
+4. **Fast CUDA.** Matrix multiplication runs on the tensor cores and is written in
+   inline PTX, NVIDIA's assembly language for its GPUs. Attention runs as one combined
+   kernel. Training uses fp16, a 16-bit float format, with loss scaling, which
+   multiplies the loss so small gradients don't round to zero. Most models train in
+   bfloat16, a different 16-bit format, but the 2080 has no hardware support for it.
+   CUDA Graphs record a whole training step once and replay it, which removes the cost
+   of launching each kernel separately.
 
 Step 4 is timed against PyTorch, and its matrix multiplication against cuBLAS (NVIDIA's
 own matrix library), on the same model size.
