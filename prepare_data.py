@@ -131,10 +131,52 @@ def clean_markup(text):
     return text
 
 
+# Pride and Prejudice (the first edition text) repeats its title page between
+# volumes: "END OF VOL. I.", the title, "VOL. II.", then the printer's address.
+VOLUME_TITLE_PAGE = re.compile(r"(?ms)^END OF (?:VOL\. [IVX]+|THE \w+ VOLUME)\.$.*?(?=^CHAPTER I\.$)")
+
+# A line counts as wrapped when the next word would have come within this many
+# characters of the width. Some lines in these editions wrap a few characters
+# early, while poems and letter closings stop 15 or more characters short.
+WRAP_SLACK = 10
+
+
+def unwrap(text):
+    """Join Project Gutenberg's hard line wraps back into paragraphs.
+
+    The ebooks wrap every line at about 71 characters, measured here from the
+    text itself. A line was wrapped if the first word of the next line would
+    not have fit on it (within WRAP_SLACK), so only those breaks are joined.
+    Lines that end early on purpose, like a poem or the closing of a letter,
+    keep their line breaks. Austen writes em dashes with no spaces around them,
+    so a break next to one joins with no space.
+    """
+    paras = text.split("\n\n")
+    inner = [len(line) for p in paras for line in p.split("\n")[:-1] if line]
+    if not inner:
+        return text
+    width = sorted(inner)[int(len(inner) * 0.99)]
+
+    out = []
+    for p in paras:
+        lines = p.split("\n")
+        joined = lines[0]
+        for prev, line in zip(lines, lines[1:]):
+            next_word = line.split(" ", 1)[0]
+            if len(prev) + 1 + len(next_word) > width - WRAP_SLACK:  # the word wrap broke here
+                glue = "" if prev.endswith("—") or line.startswith("—") else " "
+                joined += glue + line
+            else:                                               # a line break on purpose
+                joined += "\n" + line
+        out.append(joined)
+    return "\n\n".join(out)
+
+
 def austen():
     novels = []
     for title, ebook_id in AUSTEN_IDS.items():
         text = tidy(clean_markup(novel_body(gutenberg(ebook_id))))
+        text = unwrap(VOLUME_TITLE_PAGE.sub("", text)).strip()
         print(f"  {title} ({len(text):,} chars)")
         novels.append(text)
     return "\n\n\n".join(novels)
@@ -178,7 +220,9 @@ def docx_text(path):
     for p in re.findall(r"<w:p[ >].*?</w:p>", xml, flags=re.S):
         runs = re.findall(r"<w:t[^>]*>(.*?)</w:t>", p, flags=re.S)
         paras.append(html.unescape("".join(runs)))
-    return "\n".join(paras)
+    # Each <w:p> is a paragraph, so a blank line goes between them, the same
+    # paragraph break every other source uses.
+    return "\n\n".join(p for p in paras if p.strip())
 
 
 def file_text(path):
