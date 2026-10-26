@@ -6,7 +6,10 @@
 A GPT-style transformer that I'm building in C++ and CUDA. A GPT-style transformer is a
 language model that writes text by predicting what comes next, one small piece of text
 at a time. A PyTorch version of the same model is used for two things only, checking
-that my CUDA code gets the same numbers and comparing the speed of the two.
+that my CUDA code gets the same numbers and comparing the speed of the two. The fast
+version trains in 16-bit floats on the RTX 2080's tensor cores, with its matrix
+multiplies written in inline PTX, and runs about 7% faster than PyTorch on the same
+card.
 
 The training text is the Berean Standard Bible and Jane Austen's six novels, and you
 can add your own writing to it.
@@ -164,6 +167,134 @@ different random number generators. The CUDA trainer does not stop early, so its
 validation loss rises again after step 3,250, once the model starts memorizing the
 training text. At 34,387 tokens per second it runs at 61% of the speed of PyTorch's
 exact mode, before any speed tuning.
+
+The fast version builds every program twice from the same code, once with 16-bit floats
+and once with 32-bit floats:
+
+```
+make fast
+make test-fast
+make train-fast
+```
+
+The 32-bit build is there to prove the code right. It has to match the dump as closely
+as the first CUDA version does, so a speedup that breaks the math fails a test instead
+of showing up as a better number. `make test-fast` runs the first CUDA version's tests,
+then the 32-bit build's, then the 16-bit build's.
+
+expected output (from `make test-fast`, with each test's error table left out):
+
+```
+./build/test_kernels data/ref/debug.bin
+all kernels match the dump
+./build/test_gpt data/ref/debug.bin data/ref/debug_full.bin
+the whole model matches the dump
+./build/test_gemm32
+every GEMM matches
+./build/test_fast32 data/ref/debug.bin
+the fast model matches
+./build/test_generate32 data/ref/debug.bin
+generation matches
+./build/test_gemm
+every GEMM matches
+./build/test_attn data/ref/debug.bin data/ref/debug_full.bin
+flash attention matches
+./build/test_fast data/ref/debug.bin data/ref/debug_full.bin
+the fast model matches
+./build/test_generate data/ref/debug.bin
+generation matches
+```
+
+expected output (from `make train-fast`, with most steps left out):
+
+```
+./build/train_fast
+model  12,343,296 parameters | L 6 H 6 C 384 n_ctx 256 | V 4098 Vp 4160 | weights from data/ref/debug_full.bin
+data   train 1,949,203 tokens | val 216,395 tokens | 4,096 tokens per step | batches own (mt19937_64, seed 1337)
+mode   fp16 | gemm mma.sync | attention flash | graph on | loss scale dynamic from 65,536
+step    0 | val 8.366 | ln(V) = 8.318
+step  250 | train 5.740 | val 5.005 | lr 6.0e-04 | norm 0.85 | S 65536 | skipped 0 | 194,940 tok/s | mfu 36.1%
+...
+       step 2000: 2000 finite steps in a row, loss scale up to 131072
+step 2000 | train 3.280 | val 3.906 | lr 4.3e-04 | norm 1.14 | S 131072 | skipped 0 | 193,505 tok/s | mfu 35.8%
+...
+step 3500 | train 2.725 | val 3.807 | lr 1.8e-04 | norm 1.39 | S 131072 | skipped 0 | 193,394 tok/s | mfu 35.8%
+...
+step 5000 | train 2.409 | val 3.869 | lr 6.0e-05 | norm 1.70 | S 262144 | skipped 0 | 193,378 tok/s | mfu 35.8%
+speed  193,860 tok/s | MFU 35.9% of 40 TFLOPS over 4990 timed steps -> data/ref/fast_log.csv
+done   best val 3.807 at step 3500 | 0 of 5000 steps skipped | final loss scale 262144
+saved  data/ref/cuda_weights.bin
+```
+
+At 193,860 tokens per second it runs 5.6 times as fast as the 32-bit CUDA version, and
+it reaches a validation loss of 3.807, where PyTorch's exact mode reached 3.818. `S` is
+the loss scale, which [how it works](#fast-cuda) explains. It doubles after every 2,000
+steps in a row that don't overflow.
+
+`generate` writes text with the trained weights on the GPU:
+
+```
+./build/generate -w data/ref/cuda_weights.bin -t bible,austen -n 120
+```
+
+expected output:
+
+```
+data/ref/cuda_weights.bin: 12,343,296 parameters, L 6 H 6 C 384 n_ctx 256, fp16
+
+===== bible, seed 1
+<bible>
+4:11 and the chief priests, Levites, and the Levites in all, were numbered 67,600.
+
+4:12 These were the descendants of Aaron by their divisions numbered 1,52; these were the heads of the families of the descendants of Hezon, the descendants of Nathan, and the heads of the families of families.
+
+4:13 These were the heads of the families: the descendants of Noadiah son of Merari.
+
+4:14 These were the sons of Zechariah, the son of Hashab
+
+(120 tokens in 75.6 ms, 1,588 tok/s)
+===== austen, seed 1
+<austen>
+Concent on hearing this, my dear, I hope you will be very glad to see you; and I am so afraid, when I put all my heart to do very well, and then I may be sure our dear madam, if I am so nice, and I will be a very good dinner for one, I wish we shall not be in half a hint. But my dear, do not let me be so happy with her. I always think if she would.”
+
+
+[the model started a new chunk: <bible>]
+
+(120 tokens in 38.5 ms, 3,114 tok/s)
+```
+
+The first sample's speed includes warming up the GPU. `python -m reference.export`
+turns a PyTorch checkpoint into the same `weights.bin` format, and
+`python -m reference.sample --ckpt` reads either kind of file, so a model trained by one
+side can write on the other.
+
+The browser demo runs the same model on the CPU, compiled to WebAssembly, a compact
+instruction format that web browsers run at close to native speed. It needs clang, lld
+and Node.js:
+
+```
+sudo apt-get install -y clang lld nodejs python3-numpy
+make test-demo
+python -m reference.export --fp16 --out demo/weights16.bin
+make serve-demo
+```
+
+Then open http://localhost:8000. Only a model trained on the public sources should go
+into `demo/weights16.bin`, because the page hands that file to anyone who opens it.
+
+expected output (from `make test-demo`):
+
+```
+clang++ --target=wasm32 -O3 -msimd128 -mbulk-memory -nostdlib -fno-exceptions -fno-rtti -std=c++17 -Wall -Wextra -Wl,--no-entry -o demo/forward.wasm demo/forward.cpp
+python3 -m reference.export --from-dump data/ref/debug.bin --out data/ref/weights_debug.bin
+data/ref/debug.bin -> data/ref/weights_debug.bin: 370,432 values, fp32
+node demo/test_forward.mjs demo/forward.wasm data/ref/weights_debug.bin data/ref/debug.bin
+wasm model: L 2 H 4 C 64 n_ctx 64 V 4098 Vp 4160
+logits at every position vs the dump: worst 4.47e-7 at pos 11 (tol 0.00001) ok
+greedy sample() is the argmax: ok
+top_k 40 keeps the 40 largest (u = 0 picks id 282, u = 1 picks id 3931): ok
+64 tokens in 19.5 ms here
+```
 
 ## your own writing
 
@@ -367,6 +498,73 @@ Usage: ./build/train_gpt [OPTIONS ...]
   -o dir        folder for cuda_log.csv (default data/ref)
   -h            print this help message
 ```
+
+The fast trainer takes the same flags and a few more. Running `./build/train_fast -h`:
+
+```
+Usage: ./build/train_fast [OPTIONS ...]
+  -d file       dump with the model sizes and starting weights (default data/ref/debug_full.bin)
+  -w file       start from these weights instead (weights.bin, same sizes as the dump)
+  -n #          optimizer steps (default 5000)
+  -b #          sequences per step (default 16)
+  -e #          steps between evals (default 250)
+  -s file       batch starts from reference/train.py --starts (default: own random batches)
+  -g 0|1        capture the step as a CUDA Graph (default 1)
+  -G name       GEMM: mma (inline PTX), wmma, simt (fp32 cores) (default mma, fp32 build: simt)
+  -A name       attention: flash or unfused (the stage 3 kernels) (default flash, fp32 build: unfused)
+  -o dir        folder for the log and the weights (default data/ref)
+  -l name       log file name inside -o (default fast_log.csv)
+  -S file       save the trained weights here (default <-o>/cuda_weights.bin, "" for none)
+  -h            print this help message
+```
+
+`-G`, `-A` and `-g` turn each speedup off at run time, so one build measures all of
+them:
+
+```
+./build/train_fast -G simt -A unfused -g 0     # 16-bit floats, matrix multiplies on the regular cores
+./build/train_fast -G wmma -A unfused -g 0     # + tensor cores through CUDA's WMMA API
+./build/train_fast -G mma -A unfused -g 0      # + tensor cores through inline PTX
+./build/train_fast -G mma -A flash -g 0        # + flash attention
+./build/train_fast                             # + CUDA Graph
+```
+
+Running `./build/generate -h`:
+
+```
+Usage: ./build/generate [OPTIONS ...]
+  -w file       weights.bin (default data/ref/weights.bin)
+  -m file       tokenizer (default data/tokenizer.bpe)
+  -t tags       tag(s) to start from, comma separated (default bible)
+  -n #          new tokens per sample (default 300)
+  -T #          temperature, 0 = always the most likely token (default 0.8)
+  -k #          sample from the k most likely tokens, 0 = all (default 40)
+  -s seeds      seed(s), comma separated (default 1)
+  -c mode       graph (KV cache + CUDA Graph), plain (KV cache), nocache (default graph)
+  -K            keep going past the next tag (by default a sample ends where a new chunk would start)
+  -b            benchmark the three modes instead of printing text
+  -o file       with -b: also write the table as markdown (bench/results.py reads it)
+  -h            print this help message
+```
+
+The benchmarks behind the results section:
+
+```
+make bench-gemm               # every matrix multiply shape against cuBLAS -> bench/results_gemm.md
+bash bench/bench_train.sh     # every trainer and speedup -> bench/results_train.md
+python -m reference.train --fast --steps 1000 --out data/compare --starts data/compare/starts.txt
+./build/train_fast -n 1000 -s data/compare/starts.txt -o data/compare
+make curves                   # both loss curves -> bench/curves.svg
+python -m reference.export    # data/ref/best.pt -> data/ref/weights.bin
+make bench-generate           # generation speed -> bench/results_generate.md
+make results                  # copies all of it into this README
+make ptxas                    # registers and spills per kernel
+make sanitize-fast            # compute-sanitizer on the fast kernels
+```
+
+`bench_train.sh` runs PyTorch with `python.exe`, the Windows Python, unless the `PY`
+variable names another one. Every number in the results section came from these
+commands, run on the public sources only.
 
 `make sanitize-cuda` runs the kernel tests under NVIDIA's `compute-sanitizer`, which
 reports any out of bounds memory access (memcheck) and any two threads racing on the
@@ -594,18 +792,257 @@ One slice is compared differently. The key bias, the middle third of each
 that, so its true gradient is 0 and the dump holds only rounding noise there. That
 slice's AdamW update is checked against an absolute limit of 1e-6.
 
+### fast CUDA
+
+`cuda/train_fast.cu` trains the same model with the same math as the first CUDA
+version and changes how the work gets done. Each change can be switched off with a
+flag, so the results section measures each one on its own.
+
+**16-bit floats.** fp16 is a 16-bit float format. Its largest value is 65,504 and its
+smallest is about 6e-8, far less range than a 32-bit float, but the tensor cores
+multiply it about 4 times as fast. Most models train in bfloat16, a 16-bit format with
+the range of a 32-bit float, but the 2080 has no hardware support for it. So the code
+follows PyTorch's mixed precision rules. The weights the optimizer updates, the weight
+gradients, the running sums inside every matrix multiply, and anything that can grow
+past 65,504, like attention scores and the loss, stay in 32-bit floats. The matrix
+multiply inputs and most activations, the values passed from one layer to the next,
+are 16-bit. `precision.h` picks the type at compile time, so every kernel is written
+once and builds both ways.
+
+**Loss scaling.** Many gradients are smaller than 6e-8 and would round to 0 in fp16.
+Backward starts from the loss gradient multiplied by a scale `S` of 65,536, and the
+weight gradients are divided by `S` again before the optimizer uses them. `S` is a power
+of two, so multiplying and dividing by it never changes a digit. If a gradient still
+overflows to infinity, the step is skipped and `S` halves, and after 2,000 good steps
+in a row it doubles, the same rules as PyTorch's `GradScaler`. One small kernel after
+backward makes these decisions on the GPU, so the CPU never waits for the GPU in the
+middle of a step:
+
+```cpp
+if (s.found_inf)
+{
+    s.skipped++;
+    s.good_steps = 0;
+    if (cfg.dynamic_scale)
+    {
+        s.loss_scale *= 0.5f;
+    }
+}
+else
+{
+    s.adam_t++;
+    ...
+```
+
+`test_fast` forces each case. It writes an infinity into one gradient, and it sets `S`
+to 2^30 so that the loss gradient really overflows. In both, the step has to be
+skipped, the weights must not move and `S` has to halve.
+
+**The matrix multiply.** A tensor core multiplies small tiles of fp16 matrices in one
+instruction. CUDA's WMMA API reaches them from C++. The fastest version skips the API
+and writes the instructions in inline PTX, NVIDIA's assembly language for its GPUs.
+Turing's tensor core instruction multiplies a 16 by 8 tile by an 8 by 8 tile:
+
+```cpp
+// d += a b on one 16 x 8 x 8 tile, fp16 in, fp32 accumulate
+__device__ __forceinline__ void mma_16808(float d[4], const uint32_t a[2], uint32_t b)
+{
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b));
+}
+```
+
+Each block of threads computes a 128 by 128 tile of the output with 4 warps, the groups
+of 32 threads a GPU runs in lockstep, and each warp computes 64 by 64. The input tiles
+wait in shared memory, the small fast memory that one block's threads share, and
+`ldmatrix` loads them into the exact registers the multiply instruction reads. Shared
+memory is split into 32 banks, and threads that read the same bank at the same time wait
+for each other, so each row of a tile is shifted across the banks with an XOR:
+
+```cpp
+// element offset of chunk `chunk` of row `row` in a tile with 32-half rows
+__device__ __forceinline__ int kmaj(int row, int chunk)
+{
+    return row * BK + ((chunk ^ ((row >> 1) & 3)) << 3);
+}
+```
+
+Turing can't copy from GPU memory straight into shared memory in the background, so the
+next tile travels through registers while the tensor cores work on the current one. The
+bias and GELU are applied as the results are written, instead of in kernels of their
+own. Weight gradients have few output tiles and a long inner dimension, so they split
+that dimension across extra blocks, which add their parts together at the end. Over
+every multiply in a training step, these kernels run at 81% of the speed of cuBLAS,
+NVIDIA's own matrix library.
+
+**Flash attention.** The first CUDA version writes the full 256 by 256 table of
+attention scores for every head to GPU memory, then reads it back for the softmax and
+again for the next multiply. Flash attention computes the scores one tile at a time and
+keeps a running softmax in registers, so the table never exists in memory. Backward
+recomputes the scores from one saved number per row, the log of the row's softmax sum,
+instead of storing them. The output of one tensor core multiply is laid out exactly like
+the input of the next, so the probabilities go from one multiply into the next without
+passing through shared memory. This is the biggest single speedup, from 112,718 to
+193,578 tokens per second.
+
+**Smaller fusions.** The residual add and the next LayerNorm run as one kernel. Cross
+entropy writes its gradient over the logits in place, since the logits are the largest
+activation. GELU is recomputed in backward instead of saving its output, and AdamW
+updates every weight in one launch instead of one launch per tensor.
+
+**CUDA Graph.** Launching a kernel costs the CPU a few microseconds, and a training step
+launches hundreds of them. A CUDA Graph records the whole step once and replays it with
+one launch. That only works if nothing in the step depends on the CPU, so the batch
+positions of every step are uploaded before training starts, and the step counter,
+learning rate and loss scale all live in GPU memory:
+
+```cpp
+auto one_step = [&]()
+{
+    load_batch(model.x.ptr, model.y.ptr, d_train.ptr, d_starts.ptr, tc.max_steps, model.state.ptr, B, T, s);
+    model.train_step();
+};
+CudaGraph graph;
+if (use_graph)
+{
+    graph.capture(s, one_step);
+}
+```
+
+Flash attention already removed most of the launches, so the graph adds less than 1%.
+
+`test_gemm` runs every multiply shape and transpose case against the simple 32-bit
+`sgemm`. One of its inputs is a matrix of index numbers times the identity matrix, so a
+thread that holds the wrong piece of a tile shows up as a visible pattern. `test_fast`
+compares every recorded value and gradient against the dump. The 32-bit build has to
+stay within 1e-5 forward and 1e-4 backward, like the first CUDA version, and the 16-bit
+build within 1e-2 and 3e-2. The last check is the loss curve. `reference/train.py
+--starts` saves the position of every batch it trains on, `train_fast -s` trains on the
+same batches, and after 1,000 steps the two validation losses differ by 0.11%.
+
+### generation
+
+`generate` writes text one token at a time. Each new token needs the keys and values of
+every earlier token in every layer. Instead of running the whole text through the model
+again for each token, it keeps them in a KV cache on the GPU and computes only the new
+token's row. That turns each layer into a matrix times a vector, which is limited by
+reading the 25 MB of fp16 weights once per token, not by the math. Each warp reads one
+row of weights with 16-byte loads:
+
+```cpp
+// one warp, one row: W[row] . xs, every lane gets the sum
+__device__ __forceinline__ float row_dot(const floatX *W, int row, int IC, const float *xs, int lane)
+{
+    const floatX *w = W + static_cast<long long>(row) * IC;
+    float acc = 0.0f;
+    for (int c = lane; c < IC / VEC; c += 32)
+    {
+        acc += dot_vec(w + c * VEC, xs + c * VEC);
+    }
+    return warp_sum(acc);
+}
+```
+
+Sampling runs on the GPU too. Temperature comes first, then top-k by a radix select,
+which finds the k largest scores in 4 passes that each sort the scores into 256 bins by
+8 bits of their value. Then comes softmax, and one draw with a random number from the
+CPU, so a seed repeats a sample. Each step reads its token and position from GPU
+memory, so one step is recorded as a CUDA Graph and replayed for every token. With the
+cache and the graph it writes 3,259 tokens per second, against 734 when it runs the
+whole model for every token.
+
+Positions come from a learned table with 256 entries, so when the cache fills up, the
+last 128 tokens go through the full model again at positions 0 to 127 and writing
+carries on from there. `test_generate` checks that the cached path gives the same
+logits as the full forward pass at every position.
+
+### browser demo
+
+`demo/forward.cpp` is the same decode step for the CPU, compiled to WebAssembly with
+SIMD instructions, which work on 4 floats at once. It uses no C library and no
+Emscripten, and builds to 13 KB. The weights travel as fp16, 25 MB for the full model,
+and are widened to 32-bit floats once when the page loads them. On a desktop CPU the
+page writes about 200 tokens per second, and like `generate`, it keeps the last half of
+the text when the cache fills. `demo/test_forward.mjs` checks its logits against the
+dump in Node.js.
+
+<!-- results start: bench/results.py writes everything up to the end marker -->
+## results
+
+### training speed
+
+Same model (L 6, H 6, C 384), batch 16 x 256 tokens, same data. MFU = 6 x parameters x tok/s / peak.
+
+| run | tok/s | MFU | peak |
+|---|---|---|---|
+| PyTorch exact (fp32) | 55,180 | 40.9% | 10 TFLOPS |
+| PyTorch fast (fp16 autocast + SDPA) | 181,885 | 33.7% | 40 TFLOPS |
+| stage 3 (fp32 CUDA) | 34,055 | 25.2% | 10 TFLOPS |
+| stage 4 fp32 build (simt GEMMs, stage 3 attention, graph) | 38,550 | 28.6% | 10 TFLOPS |
+| fp16 + loss scaling, simt GEMMs | 39,087 | 7.2% | 40 TFLOPS |
+| + wmma tensor core GEMMs | 94,564 | 17.5% | 40 TFLOPS |
+| + mma.sync + ldmatrix GEMMs | 112,718 | 20.9% | 40 TFLOPS |
+| + flash attention | 193,578 | 35.8% | 40 TFLOPS |
+| + CUDA Graph (all of stage 4) | 194,250 | 36.0% | 40 TFLOPS |
+
+300 steps per run, measured 2026-10-26 on NVIDIA GeForce RTX 2080.
+The fused small kernels (residual + LayerNorm, in place cross entropy, one pass unscale + norm,
+one launch AdamW, GELU recompute) are part of every train_fast row.
+
+### GEMMs against cuBLAS
+
+Every GEMM shape of one training step, fp16 in and fp32 accumulate. Each cell: TFLOPS, and speed as a percent of cuBLAS (100% = as fast as cuBLAS).
+
+| GEMM | M x N x K | cuBLAS | mma.sync | wmma | simt |
+|---|---|---|---|---|---|
+| c_attn fwd | 4096 x 1152 x 384 | 26.8 TFLOPS | 21.7 TFLOPS, 81% | 15.0 TFLOPS, 56% | 3.4 TFLOPS, 13% |
+| attn c_proj fwd | 4096 x 384 x 384 | 22.6 TFLOPS | 15.8 TFLOPS, 70% | 15.0 TFLOPS, 66% | 3.4 TFLOPS, 15% |
+| c_fc fwd | 4096 x 1536 x 384 | 29.8 TFLOPS | 25.7 TFLOPS, 86% | 20.0 TFLOPS, 67% | 4.0 TFLOPS, 14% |
+| mlp c_proj fwd | 4096 x 384 x 1536 | 33.3 TFLOPS | 22.2 TFLOPS, 67% | 18.2 TFLOPS, 54% | 3.8 TFLOPS, 11% |
+| logits fwd | 4096 x 4160 x 384 | 35.7 TFLOPS | 28.9 TFLOPS, 81% | 18.8 TFLOPS, 53% | 4.1 TFLOPS, 11% |
+| c_attn dinp | 4096 x 384 x 1152 | 31.6 TFLOPS | 24.4 TFLOPS, 77% | 14.0 TFLOPS, 44% | 4.0 TFLOPS, 13% |
+| attn c_proj dinp | 4096 x 384 x 384 | 25.1 TFLOPS | 20.7 TFLOPS, 82% | 14.0 TFLOPS, 56% | 3.9 TFLOPS, 16% |
+| c_fc dinp | 4096 x 384 x 1536 | 30.9 TFLOPS | 23.5 TFLOPS, 76% | 13.8 TFLOPS, 45% | 4.0 TFLOPS, 13% |
+| mlp c_proj dinp | 4096 x 1536 x 384 | 31.7 TFLOPS | 27.2 TFLOPS, 86% | 16.7 TFLOPS, 53% | 4.2 TFLOPS, 13% |
+| logits dinp | 4096 x 384 x 4160 | 37.6 TFLOPS | 24.0 TFLOPS, 64% | 14.0 TFLOPS, 37% | 4.0 TFLOPS, 11% |
+| c_attn dW | 1152 x 384 x 4096 | 25.3 TFLOPS | 23.8 TFLOPS, 94% | 12.3 TFLOPS, 49% | 3.2 TFLOPS, 13% |
+| attn c_proj dW | 384 x 384 x 4096 | 21.0 TFLOPS | 18.4 TFLOPS, 88% | 8.8 TFLOPS, 42% | 2.5 TFLOPS, 12% |
+| c_fc dW | 1536 x 384 x 4096 | 32.3 TFLOPS | 26.8 TFLOPS, 83% | 15.9 TFLOPS, 49% | 3.3 TFLOPS, 10% |
+| mlp c_proj dW | 384 x 1536 x 4096 | 29.6 TFLOPS | 27.0 TFLOPS, 91% | 16.1 TFLOPS, 55% | 3.3 TFLOPS, 11% |
+| logits dW | 4160 x 384 x 4096 | 27.4 TFLOPS | 24.4 TFLOPS, 89% | 13.0 TFLOPS, 47% | 4.0 TFLOPS, 15% |
+| one training step | | 10.08 ms | 12.43 ms (81%) | 19.75 ms (51%) | 82.11 ms (12%) |
+
+### loss curves
+
+PyTorch fast mode and train_fast on the same batches (reference/train.py --starts, train_fast -s).
+
+![loss curves of PyTorch fast mode and train_fast](bench/curves.svg)
+
+- PyTorch fast: val 4.3128 at step 1000
+- CUDA (train_fast): val 4.3081 at step 1000
+- difference at step 1000: -0.11% (the bar is about 1%)
+
+### generation
+
+Tokens per second for one sample, prompt and every cache rollover included.
+
+| generation (fp16, 500 new tokens, temperature 0.8, top_k 40) | tok/s | ms |
+|---|---|---|
+| KV cache + CUDA Graph | 3,259 | 153.4 |
+| KV cache, plain launches | 2,981 | 167.7 |
+| no cache (full forward per token) | 734 | 681.1 |
+
+<!-- results end -->
+
 ## plan
 
-The data scripts, the tokenizer, the PyTorch reference model and the 32-bit CUDA
-version are written. The last step:
+The data scripts, the tokenizer, the PyTorch reference model, the 32-bit CUDA version,
+the fast version and generation are written. The next step is a model that can chat:
 
-4. **Fast CUDA.** Matrix multiplication runs on the tensor cores and is written in
-   inline PTX, NVIDIA's assembly language for its GPUs. Attention runs as one combined
-   kernel. Training uses fp16, a 16-bit float format, with loss scaling, which
-   multiplies the loss so small gradients don't round to zero. Most models train in
-   bfloat16, a different 16-bit format, but the 2080 has no hardware support for it.
-   CUDA Graphs record a whole training step once and replay it, which removes the cost
-   of launching each kernel separately.
-
-Step 4 is timed against PyTorch, and its matrix multiplication against cuBLAS (NVIDIA's
-own matrix library), on the same model size.
+5. **A chat model.** Pretraining on FineWeb-Edu, a large set of educational web pages,
+   gives the model far more English than the Bible and Austen hold. Then it is
+   fine-tuned on the conversations in smol-smoltalk, with `<user>` and `<assistant>`
+   as tags of their own, and the loss counts only the assistant's tokens, so it learns
+   to answer rather than to ask. The playground and the browser demo then get a chat
+   box that keeps the conversation in the KV cache.
