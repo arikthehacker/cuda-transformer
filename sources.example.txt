@@ -1,0 +1,12 @@
+# Copy this file to sources.local.txt and list your own writing.
+# Each [section] becomes a source, and its name becomes the tag on its text, like <essays>.
+# A line can be a file or folder (.pdf, .docx, .txt, .md), "!name" to skip any file with
+# that name, or "wattpad:<username>" for every public story on that account.
+# "~" means your home folder.
+
+[essays]
+~/Documents/essays
+!transcript.pdf
+
+[stories]
+wattpad:your-username
