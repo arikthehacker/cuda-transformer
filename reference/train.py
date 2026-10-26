@@ -166,6 +166,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", default=REF_DIR, help=f"folder for checkpoints and logs (default {REF_DIR})")
     p.add_argument("--fast", action="store_true", help="fp16 autocast + scaled_dot_product_attention")
     p.add_argument("--resume", action="store_true", help="continue from OUT/last.pt")
+    p.add_argument("--starts", metavar="FILE",
+                   help="write every step's batch starts to FILE, one line of B numbers per step, so "
+                        "cuda/train_fast -s FILE trains on the same batches (costs a little speed)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
                    help="cuda or cpu (default: cuda when there is one)")
     return p.parse_args(argv)
@@ -235,7 +238,6 @@ def main(argv: list[str] | None = None) -> None:
 
     n_params = model.num_params()
     tokens_per_step = tc.batch_size * cfg.n_ctx
-    peak = tc.peak_tflops_fp16 if args.fast else tc.peak_tflops_fp32    # MFU is against this
     mode = "fast (fp16 autocast + SDPA)" if args.fast else "exact (fp32, deterministic)"
     print(f"model  {n_params:,} parameters | L {cfg.n_layer} H {cfg.n_head} C {cfg.n_embd} "
           f"n_ctx {cfg.n_ctx} | V {cfg.vocab_size} Vp {cfg.padded_vocab}")
@@ -246,6 +248,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"step {start_step:4d} | val {val:.3f} | ln(V) = {math.log(cfg.vocab_size):.3f}")
 
     cuda = device.type == "cuda"
+    peak = tc.peak_tflops_fp16 if args.fast else tc.peak_tflops_fp32    # MFU against the peak of the math in use
 
     def sync() -> None:
         if cuda:
@@ -270,6 +273,8 @@ def main(argv: list[str] | None = None) -> None:
         log.writerow([0, "", f"{val:.6f}", "", "", ""])
 
     rows = []                       # finished steps not yet in log.csv: (step, loss, norm, lr, start, end)
+    starts_file = open(args.starts, "a" if ckpt else "w", encoding="utf-8") if args.starts else None
+    pending_starts = []             # (B,) GPU tensors, written at the next eval (no sync per step)
     timed_from = start_step + tc.timing_skip
     window_start = None             # wall clock at the start of the current timing window
     window_steps = 0
@@ -287,6 +292,8 @@ def main(argv: list[str] | None = None) -> None:
         lr = lr_at(step, tc)
         t0 = clock()
         x, y = batches.next()                                       # (B, T), (B, T)
+        if starts_file:
+            pending_starts.append(batches.last_starts)
         loss, norm = train_step(model, opt, scaler, x, y, lr, tc.grad_clip)
         rows.append((step + 1, loss, norm, lr, t0, clock()))
         step += 1
@@ -309,6 +316,11 @@ def main(argv: list[str] | None = None) -> None:
                 log.writerow([s, f"{losses[i]:.6f}", f"{val:.6f}" if last else "", f"{r_lr:.6e}",
                               f"{n.item():.4f}", f"{step_ms(a, b):.2f}"])
             log_file.flush()
+            if starts_file:
+                for s in pending_starts:
+                    starts_file.write(" ".join(str(v) for v in s.tolist()) + "\n")
+                starts_file.flush()
+                pending_starts = []
             last_norm = rows[-1][2].item()
             rows = []
 
@@ -338,6 +350,8 @@ def main(argv: list[str] | None = None) -> None:
                 window_steps = 0
 
     log_file.close()
+    if starts_file:
+        starts_file.close()
     print(f"done   best val {best_val:.3f} at step {best_step} -> {os.path.join(args.out, 'best.pt')}")
     if timed_steps > 0:
         avg = timed_steps * tokens_per_step / timed_secs

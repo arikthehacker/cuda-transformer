@@ -65,6 +65,7 @@ class Batches:
         """(x, y), each (B, T) int64."""
         starts = torch.randint(0, self.num_starts, (self.batch_size,),
                                generator=self.gen, device=self.device)  # (B,)
+        self.last_starts = starts                                       # train.py --starts writes these
         chunk = self.tokens[starts[:, None] + self.offsets[None, :]]    # (B, T+1)
         return chunk[:, :-1], chunk[:, 1:]                              # (B, T), (B, T)
 
