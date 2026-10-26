@@ -14,6 +14,10 @@ card.
 The training text is the Berean Standard Bible and Jane Austen's six novels, and you
 can add your own writing to it.
 
+A second, bigger model is for chatting. It learns English from FineWeb-Edu, a large set
+of educational web pages, and then learns to answer from the conversations in
+smol-smoltalk. `make chat` talks to it in the terminal.
+
 ## quickstart
 
 ```
@@ -363,6 +367,75 @@ your own words if you give it some. The right side shows the build log and what 
 model wrote. The window uses tkinter, which comes with Python, and opens in about a
 tenth of a second.
 
+## chat model
+
+The chat model has 8 layers, 512 numbers per token and 512 tokens of context, 33.9M
+parameters in all, against 12.3M for the first model. It trains in two parts.
+Pretraining on FineWeb-Edu teaches it English, and fine-tuning on smol-smoltalk teaches
+it to answer. Both data sets are public, and nothing from `my_writing/` goes into this
+model. The download needs two more packages for the Windows Python and about 10 GB of
+free disk:
+
+```
+pip install pyarrow huggingface_hub
+python.exe prepare_chat.py --max-chars 20000000    # a 20 MB test run first
+make chat-data          # FineWeb-Edu and smol-smoltalk -> data/chat/*.txt
+make chat-tokens        # tokenizer, token files, SFT targets, starting weights
+make test-chat          # masked loss, checkpoints, chat in the KV cache
+make chat-pretrain      # 30,000 steps on web text
+make chat-sft           # 6,000 steps on the answers of the conversations
+make chat               # talk to it
+```
+
+expected output (the lines of `make chat-tokens` that check the tokenizer, the times
+change from run to run):
+
+```
+./build/bpe -t -i data/chat/tok_sample.txt -n 16384 -o data/chat/tokenizer.bpe -v
+...
+merges 16128, specials 3 (<web> <user> <assistant>), vocab 16387, ...
+python.exe -m reference.chat --check-tokenizer data/chat/tokenizer.bpe
+data/chat/tokenizer.bpe: 16,387 ids, specials 3 (<web> <user> <assistant>), nothing else
+```
+
+`make chat-data` runs `prepare_chat.py`. It downloads FineWeb-Edu's `sample/10BT`
+parquet files one at a time, with their names read from the data set's file list, and
+writes every web page as `<web>` and its text, about 4.5 GB in files of 256 MB. One page
+in every 100 goes to `pretrain_val.txt`. smol-smoltalk's train and test splits become
+`sft_train.txt` and `sft_val.txt`, each conversation as `<user>` and `<assistant>`
+turns that end with a `<user>` line of its own, so the model learns where an answer
+stops. System messages are left out, since `make chat` has no system prompt.
+
+`make chat-tokens` trains the tokenizer on the first 300 MB of web text and every
+conversation, then stops if the tokenizer has any tag besides the three. It encodes
+every text file, joins the web text's token files into `pretrain_train.bin`, and writes
+the SFT targets (see the chat model part of how it works). Last, `reference/export.py --init` writes PyTorch's starting
+weights for the chat size to `data/chat/init.bin`, so the CUDA trainer starts from the
+same numbers PyTorch would.
+
+`make chat-pretrain` trains on batches of 16 x 512 tokens, so its 30,000 steps cover
+246M tokens. The whole set is about 1B tokens, and `make chat-pretrain
+CHAT_STEPS=122000` trains on all of it, an estimated 4.5 hours at 60,000 tokens per
+second. A checkpoint goes to `data/chat/pre/ckpt.bin` after every eval, and if the
+computer stops, `make chat-pretrain RESUME=1` carries on from the last one with the
+same batches and settings. If the PC shuts down under the load, `nvidia-smi -pl 180`
+in an administrator terminal on Windows lowers the card's power limit until the next
+restart.
+
+`make chat-sft` starts from the pretrained weights with a fresh optimizer, a learning
+rate of 1e-4 instead of 6e-4 and 100 warmup steps. Every batch row starts at the
+beginning of a conversation, and the loss counts only the answers. 6,000 steps draw
+about 96,000 of the 460,000 conversations, and `SFT_STEPS=29000` draws each one once
+on average. `make chat-results` and then `make results` put both runs into the results
+section.
+
+`make chat` runs `./build/generate --chat`. Each line typed in is one message, and an
+empty line ends the conversation. The whole conversation stays in the KV cache, so
+each message only runs its own tokens through the model. The answer prints as it is
+written, and after each one comes a line holding only `\x1e`, the ASCII record
+separator, so a program reading the output can tell where an answer ends. The prompt
+and everything else go to stderr.
+
 ## menu
 
 `python playground.py` opens a menu for trying each part on your own text. Run it from
@@ -463,19 +536,34 @@ Usage: ./build/bpe [-t|-e|-d] [OPTIONS ...]
 The reference model's scripts each take `-h`. Running `python -m reference.train -h`:
 
 ```
-usage: train.py [-h] [--steps STEPS] [--batch BATCH] [--out OUT] [--fast] [--resume]
-                [--device DEVICE]
+usage: train.py [-h] [--steps STEPS] [--batch BATCH] [--out OUT] [--fast] [--resume] [--starts FILE]
+                [--device DEVICE] [--config {chat,small}] [--data PREFIX] [--tokenizer FILE]
+                [--init FILE] [--sft] [--lr LR] [--min-lr MIN_LR] [--warmup WARMUP]
 
 Train the reference GPT. Run from the repo root.
 
 options:
-  -h, --help       show this help message and exit
-  --steps STEPS    optimizer steps (default 5000)
-  --batch BATCH    sequences per step (default 16)
-  --out OUT        folder for checkpoints and logs (default data/ref)
-  --fast           fp16 autocast + scaled_dot_product_attention
-  --resume         continue from OUT/last.pt
-  --device DEVICE  cuda or cpu (default: cuda when there is one)
+  -h, --help            show this help message and exit
+  --steps STEPS         optimizer steps (default 5000)
+  --batch BATCH         sequences per step (default 16)
+  --out OUT             folder for checkpoints and logs (default data/ref)
+  --fast                fp16 autocast + scaled_dot_product_attention
+  --resume              continue from OUT/last.pt
+  --starts FILE         write every step's batch starts to FILE, one line of B numbers per step,
+                        so cuda/train_fast -s FILE trains on the same batches (costs a little
+                        speed)
+  --device DEVICE       cuda or cpu (default: cuda when there is one)
+  --config {chat,small}
+                        model size: small (L 6, C 384, n_ctx 256, the default) or chat (L 8, C
+                        512, n_ctx 512)
+  --data PREFIX         PREFIX_train.bin and PREFIX_val.bin, e.g. data/chat/pretrain (default
+                        data/train.bin, data/val.bin)
+  --tokenizer FILE      default data/tokenizer.bpe, or tokenizer.bpe in the folder of --data
+  --init FILE           start from this weights.bin (and its sizes), not a fresh init
+  --sft                 train on the answers only (reference/chat.py); lr 1e-4, warmup 100
+  --lr LR               peak learning rate (default 6e-4, --sft 1e-4)
+  --min-lr MIN_LR       learning rate at the end (default 6e-5, --sft 1e-5)
+  --warmup WARMUP       warmup steps (default 200; 2000 for the chat pretrain)
 ```
 
 Sampling and the answer key:
@@ -485,6 +573,9 @@ python -m reference.sample --tag bible austen --seed 1 2    # four samples
 python -m reference.dump                                    # tiny model -> data/ref/debug.bin
 python -m reference.dump --full                             # full size -> data/ref/debug_full.bin
 python -m reference.dump --compare data/ref/debug.bin mine.bin   # error table
+python -m reference.dump --config chat --masked             # chat tokenizer, half the targets -1
+python -m reference.chat --tokens data/chat/sft_train.bin --n-ctx 512    # SFT targets -> sft_train.tgt
+python -m reference.export --init --config chat --vocab-from data/chat/tokenizer.bpe --out data/chat/init.bin
 ```
 
 The CUDA trainer takes flags too. Running `./build/train_gpt -h`:
@@ -504,17 +595,26 @@ The fast trainer takes the same flags and a few more. Running `./build/train_fas
 ```
 Usage: ./build/train_fast [OPTIONS ...]
   -d file       dump with the model sizes and starting weights (default data/ref/debug_full.bin)
-  -w file       start from these weights instead (weights.bin, same sizes as the dump)
+  -w file       start from these weights instead (weights.bin); without -d its header gives the sizes
+  -D prefix     data: prefix_train.bin and prefix_val.bin (default data/train.bin, data/val.bin)
+  --sft         train on the answers only: targets from prefix_train.tgt and prefix_val.tgt
+                (python.exe -m reference.chat), lr 1e-4, min lr 1e-5, warmup 100
   -n #          optimizer steps (default 5000)
   -b #          sequences per step (default 16)
   -e #          steps between evals (default 250)
+  --lr x        peak learning rate (default 6e-4, --sft 1e-4)
+  --min-lr x    learning rate at the end (default 6e-5, --sft 1e-5)
+  --warmup #    warmup steps (default 200, --sft 100; 2000 for the chat pretrain)
   -s file       batch starts from reference/train.py --starts (default: own random batches)
+  -c dir        checkpoint dir: dir/ckpt.bin after every eval, and the log and weights.bin go here
+  -r            resume from <-c dir>/ckpt.bin, with the settings saved in it
   -g 0|1        capture the step as a CUDA Graph (default 1)
   -G name       GEMM: mma (inline PTX), wmma, simt (fp32 cores) (default mma, fp32 build: simt)
   -A name       attention: flash or unfused (the stage 3 kernels) (default flash, fp32 build: unfused)
-  -o dir        folder for the log and the weights (default data/ref)
+  -o dir        folder for the log and the weights (default data/ref, or the -c dir)
   -l name       log file name inside -o (default fast_log.csv)
-  -S file       save the trained weights here (default <-o>/cuda_weights.bin, "" for none)
+  -S file       save the trained weights here (default <-o>/cuda_weights.bin, with -c <dir>/weights.bin,
+                "" for none)
   -h            print this help message
 ```
 
@@ -542,6 +642,7 @@ Usage: ./build/generate [OPTIONS ...]
   -s seeds      seed(s), comma separated (default 1)
   -c mode       graph (KV cache + CUDA Graph), plain (KV cache), nocache (default graph)
   -K            keep going past the next tag (by default a sample ends where a new chunk would start)
+  --chat        a conversation on stdin / stdout (the stage 6 chat model); -n caps each answer
   -b            benchmark the three modes instead of printing text
   -o file       with -b: also write the table as markdown (bench/results.py reads it)
   -h            print this help message
@@ -967,6 +1068,136 @@ page writes about 200 tokens per second, and like `generate`, it keeps the last 
 the text when the cache fills. `demo/test_forward.mjs` checks its logits against the
 dump in Node.js.
 
+`make demo-chat` puts the chat model in the page instead. Its weights are about 68 MB as
+fp16 and 136 MB once widened, against 25 MB for the first model, so the page takes
+longer to load them, and each token reads almost three times as many weights.
+
+### chat model
+
+**Tags in web text.** The tokenizer turns any line that is only `<letters>` into a tag
+of its own, and adds a new one for every such line it sees while training. Web pages
+have lines like `<div>`, and one of them would become a token forever. So every line of
+web and chat text goes through `safe_lines` first, and `make chat-tokens` stops if the
+tokenizer comes out with any tag besides `<web>`, `<user>` and `<assistant>`:
+
+```python
+TAG_LINE = re.compile(r"^<[a-z_]+>$")
+
+def safe_lines(text: str) -> str:
+    """Every tag-shaped line gets one leading space, so it stays plain text."""
+    return "\n".join(" " + line if TAG_LINE.match(line) else line for line in text.split("\n"))
+```
+
+**Training on the answers only.** In fine-tuning, the target of a token is the next
+token only when that one is part of an answer, and -1 otherwise, which the loss skips.
+The `<user>` tag after an answer counts too, since predicting it is how the model
+learns to stop. `reference/chat.py` finds each answer as the span from just after
+`<assistant>` and its newline up to the next tag:
+
+```python
+first = asst + 1 + (t[np.minimum(asst + 1, n - 1)] == NEWLINE)
+nxt = np.searchsorted(tag_pos, asst, side="right")
+last = np.where(has_next, tag_pos[np.minimum(nxt, tag_pos.size - 1)], n - 1)
+counted = _ranges(first[ok], last[ok], n)          # token j is part of an assistant turn
+y[:-1] = np.where(counted[1:], t[1:], -1)
+```
+
+Batch rows start only where a conversation starts, so a row never begins halfway
+through an answer. An answer that does not fit in the 512 tokens from its
+conversation's start is dropped with every answer after it, which cuts the
+conversation at a turn boundary, and a conversation with no answer left is dropped.
+`reference/chat.py` prints how many were kept whole, cut and dropped, and writes the
+targets and starts to a `.tgt` file for `train_fast --sft`.
+
+**The masked loss on the GPU.** The loss is the mean over the counted targets, not over
+all 8,192 tokens of the batch, or short answers would get smaller gradients than long
+ones. One block counts the targets that are not -1 into the GPU-side step state, and
+the cross entropy kernel reads that count when it scales the gradient. A row whose
+target is -1 gets a loss of 0 and a gradient of 0:
+
+```cpp
+int target = targets[n];
+if (target < 0)                         // not counted: no loss, no gradient (the whole block takes this branch)
+{
+    if (threadIdx.x == 0)
+    {
+        losses[n] = 0.0f;
+    }
+    if (grad)
+    {
+        for (int j = threadIdx.x; j < Vp; j += blockDim.x)
+        {
+            l[j] = from_float<floatX>(0.0f);
+        }
+    }
+    return;
+}
+```
+
+The count is at least 1, so a batch with nothing counted gives a loss of 0 instead of
+dividing by 0. Outside fine-tuning every target counts, the count is 16 x 512, and the
+numbers are the same as before. `test_fast` checks the masked loss, the gradients and
+the zero rows against `reference/dump.py --config chat --masked`, a dump with about
+half its targets set to -1 and one row with none counted at all.
+
+**1B tokens on the GPU.** The pretraining tokens stay on the GPU as 16-bit ids, 2 GB
+for 1B tokens instead of 4 GB as 32-bit ints, and the batch kernel widens them as it
+copies a batch out. On the PyTorch side, a token file that big stays in CPU memory and
+only each batch goes to the GPU.
+
+**Checkpoints.** A 4.5 hour run should survive the PC shutting down, so `train_fast -c`
+saves the weights, both AdamW buffers, the step state (loss scale, step, AdamW's step
+count) and the run's settings after every eval. The file is written under a temporary
+name, flushed to the disk, and only then renamed over the old one, so a crash never
+leaves half a checkpoint:
+
+```cpp
+bool flushed = fflush(f) == 0;
+bool synced = fsync(fileno(f)) == 0;
+bool closed = fclose(f) == 0;
+...
+if (rename(tmp.c_str(), path.c_str()) != 0)
+```
+
+`train_fast -r` reads it back, makes the same list of batch starts, and carries on at
+the saved step. `test_checkpoint` trains 20 steps straight, then 10 steps, a
+checkpoint, a new model loaded from the file and 10 more, and the losses must match
+bit for bit. On a GPU, the sums that use atomics add in a different order on every run,
+so the test first runs the 20 steps twice to see how far two straight runs drift, and
+holds the resumed run to that.
+
+**Chat in the KV cache.** A message goes in one token at a time. Each token runs
+through every layer to put its keys and values in the cache, and the next token is
+known, so nothing is sampled:
+
+```cpp
+void Generator::feed_one(int token)
+{
+    cudaStream_t s = model.stream;
+    if (chat_pos == cfg.n_ctx)
+    {
+        int m = cfg.n_ctx / 2;
+        prefill(m, chat_n, SampleConfig{0.0f, 0}, true, false);
+        push_token(state.ptr, history.ptr, token, m, s);
+        chat_pos = m;
+    }
+    else
+    {
+        decode_layers();
+        push_token(state.ptr, history.ptr, token, -1, s);
+        chat_pos++;
+    }
+    chat_n++;
+    chat_total++;
+}
+```
+
+Then the answer is sampled one token at a time until the model writes a tag. If the tag
+is not `<user>`, it is swapped for `<user>`, which then waits as the first token of the
+next message. When the cache fills, it keeps the last half, the same as `generate`.
+`test_generate` checks that a conversation kept in the cache over 8 turns, past cache
+rollovers, answers exactly like the same conversation fed in all at once.
+
 <!-- results start: bench/results.py writes everything up to the end marker -->
 ## results
 
@@ -1033,16 +1264,30 @@ Tokens per second for one sample, prompt and every cache rollover included.
 | KV cache, plain launches | 2,981 | 167.7 |
 | no cache (full forward per token) | 734 | 681.1 |
 
+### chat model
+
+L 8, H 8, C 512, n_ctx 512, 33.9M parameters, batch 16 x 512 tokens. Pretrained on FineWeb-Edu, then fine-tuned on smol-smoltalk (bench/chat_results.py reads both train_fast logs).
+
+not measured yet (`bench/results_chat.md` does not exist)
+
 <!-- results end -->
 
 ## plan
 
 The data scripts, the tokenizer, the PyTorch reference model, the 32-bit CUDA version,
-the fast version and generation are written. The next step is a model that can chat:
+the fast version, generation and the chat model's code are written. Next:
 
-5. **A chat model.** Pretraining on FineWeb-Edu, a large set of educational web pages,
-   gives the model far more English than the Bible and Austen hold. Then it is
-   fine-tuned on the conversations in smol-smoltalk, with `<user>` and `<assistant>`
-   as tags of their own, and the loss counts only the assistant's tokens, so it learns
-   to answer rather than to ask. The playground and the browser demo then get a chat
-   box that keeps the conversation in the KV cache.
+5. **Training the chat model.** Pretraining on FineWeb-Edu, then fine-tuning on
+   smol-smoltalk, with the numbers in the results section.
+6. **A chat box.** The playground and `gui.py` get a chat box over
+   `./build/generate --chat`, which keeps the conversation in the KV cache.
+
+## credits
+
+The chat model is trained on two public data sets:
+
+- [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu), the
+  `sample-10BT` subset, by Hugging Face, under the
+  [Open Data Commons Attribution License (ODC-By) v1.0](https://opendatacommons.org/licenses/by/1-0/).
+- [smol-smoltalk](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk), by
+  Hugging Face, under the Apache 2.0 license.

@@ -258,3 +258,89 @@ serve-demo: demo
 	python3 -m http.server 8000 -d demo
 
 .PHONY: demo test-demo serve-demo
+
+
+# ==================================================================== stage 6: a chat model
+
+# FineWeb-Edu (ODC-By) for pretraining, smol-smoltalk (Apache 2.0) for chat.
+# Only these public sources go into this model: no my_writing/ here.
+CHAT       = data/chat
+CHAT_TOK   = $(CHAT)/tokenizer.bpe
+MASKED     = data/ref/debug_chat_masked.bin
+# B 16 x T 512 = 8,192 tokens a step: 30,000 steps is 246M tokens, the full
+# 1B token set is about 122,000. SFT: 6,000 steps draws about 96k of the
+# ~460k conversations; one draw each is about 29,000.
+CHAT_STEPS ?= 30000
+SFT_STEPS  ?= 6000
+# make chat-pretrain RESUME=1 (or chat-sft) picks a stopped run up from its last checkpoint
+RESUME_FLAG = $(if $(RESUME),-r)
+# where the pretraining run lives: a 100M token test run can go elsewhere,
+# e.g. make chat-pretrain CHAT_STEPS=12200 PRE_DIR=data/chat/pre100m
+PRE_DIR   ?= $(CHAT)/pre
+
+chat-data:
+	python.exe prepare_chat.py
+
+# the tokenizer, then every text file as BPE1 tokens, the SFT targets, and PyTorch's starting weights
+chat-tokens: $(BUILD)/bpe
+	head -c 300000000 $(CHAT)/pretrain_000.txt | sed '$$d' > $(CHAT)/tok_sample.txt
+	cat $(CHAT)/sft_train.txt >> $(CHAT)/tok_sample.txt
+	./$(BUILD)/bpe -t -i $(CHAT)/tok_sample.txt -n 16384 -o $(CHAT_TOK) -v
+	python.exe -m reference.chat --check-tokenizer $(CHAT_TOK)
+	for f in $(CHAT)/pretrain_[0-9][0-9][0-9].txt; do \
+		./$(BUILD)/bpe -e -m $(CHAT_TOK) -i $$f -o $${f%.txt}.bin || exit 1; \
+	done
+	python.exe prepare_chat.py --join
+	./$(BUILD)/bpe -e -m $(CHAT_TOK) -i $(CHAT)/pretrain_val.txt -o $(CHAT)/pretrain_val.bin
+	./$(BUILD)/bpe -e -m $(CHAT_TOK) -i $(CHAT)/sft_train.txt -o $(CHAT)/sft_train.bin
+	./$(BUILD)/bpe -e -m $(CHAT_TOK) -i $(CHAT)/sft_val.txt -o $(CHAT)/sft_val.bin
+	python.exe -m reference.chat --tokens $(CHAT)/sft_train.bin --tokenizer $(CHAT_TOK) --n-ctx 512
+	python.exe -m reference.chat --tokens $(CHAT)/sft_val.bin --tokenizer $(CHAT_TOK) --n-ctx 512
+	python.exe -m reference.export --init --config chat --vocab-from $(CHAT_TOK) --out $(CHAT)/init.bin
+
+# a checkpoint (about 400 MB) after every eval; -e 1000 keeps the writes to one every couple of minutes
+chat-pretrain: $(BUILD)/train_fast
+	./$(BUILD)/train_fast -w $(CHAT)/init.bin -D $(CHAT)/pretrain --warmup 2000 -n $(CHAT_STEPS) -e 1000 \
+		-c $(PRE_DIR) $(RESUME_FLAG)
+
+# lr 1e-4, warmup 100, a fresh AdamW (the pretrain's moments stay in its own checkpoint)
+chat-sft: $(BUILD)/train_fast
+	./$(BUILD)/train_fast -w $(PRE_DIR)/weights.bin -D $(CHAT)/sft --sft -n $(SFT_STEPS) -e 500 \
+		-c $(CHAT)/sft $(RESUME_FLAG)
+
+# PyTorch and train_fast on the same 500 batches at the chat size, from the same starting weights
+chat-compare: $(BUILD)/train_fast
+	python.exe -m reference.train --fast --init $(CHAT)/init.bin --data $(CHAT)/pretrain --steps 500 \
+		--out $(CHAT)/compare --starts $(CHAT)/compare/starts.txt
+	./$(BUILD)/train_fast -w $(CHAT)/init.bin -D $(CHAT)/pretrain -n 500 -s $(CHAT)/compare/starts.txt \
+		-o $(CHAT)/compare -S ""
+	python3 bench/curves.py --torch $(CHAT)/compare/log.csv --cuda $(CHAT)/compare/fast_log.csv \
+		--out bench/curves_chat.svg --md bench/results_curves_chat.md
+
+chat: $(BUILD)/generate
+	./$(BUILD)/generate -w $(CHAT)/sft/weights.bin -m $(CHAT_TOK) --chat
+
+$(MASKED):
+	python.exe -m reference.dump --config chat --masked
+
+# masked cross entropy against PyTorch, checkpoints and resuming, chat in the KV cache
+test-chat: $(BUILD)/test_fast $(BUILD)/test_fast32 $(BUILD)/test_checkpoint $(BUILD)/test_checkpoint32 \
+           $(BUILD)/test_generate $(BUILD)/test_generate32 $(MASKED)
+	python.exe -m reference.test_chat
+	./$(BUILD)/test_fast32 $(DUMP) $(MASKED)
+	./$(BUILD)/test_fast $(DUMP) $(MASKED)
+	./$(BUILD)/test_checkpoint32 $(DUMP)
+	./$(BUILD)/test_checkpoint $(DUMP)
+	./$(BUILD)/test_generate32 $(DUMP)
+	./$(BUILD)/test_generate $(DUMP)
+
+# the chat model in the browser: about 68 MB of fp16 weights (34M parameters)
+demo-chat: demo/forward.wasm
+	cp $(CHAT_TOK) demo/tokenizer.bpe
+	python.exe -m reference.export --weights $(CHAT)/sft/weights.bin --fp16 --out demo/weights16.bin
+
+# the chat rows of the results section, from both training logs
+chat-results:
+	python3 bench/chat_results.py
+
+.PHONY: chat-data chat-tokens chat-pretrain chat-sft chat-compare chat test-chat demo-chat chat-results
