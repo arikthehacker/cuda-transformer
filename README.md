@@ -165,6 +165,73 @@ validation loss rises again after step 3,250, once the model starts memorizing t
 training text. At 34,387 tokens per second it runs at 61% of the speed of PyTorch's
 exact mode, before any speed tuning.
 
+## your own writing
+
+To train the model on your own writing, put your files in a folder called `my_writing/`
+at the top of the repo, with one folder inside it for each style of writing. Each
+folder's name becomes the tag the model is started with, so the files in
+`my_writing/essays/` train under `<essays>`. Files placed directly in `my_writing/` go
+under `<mine>`. PDF, Word (`.docx`), `.txt` and `.md` files work, and git ignores the
+whole folder.
+
+`pipeline.py` runs every step in order, from your files to a trained model:
+
+```
+python pipeline.py add essays ~/Documents/essays
+python pipeline.py build
+python playground.py
+```
+
+`add` copies the files into `my_writing/essays/` and leaves the originals where they
+are. `build` gathers the text, mixes it with the Bible and Austen, trains the tokenizer,
+and trains the model in fast mode, which stops on its own once the validation loss
+stops improving. `build --no-public` leaves out the Bible and Austen and trains on your
+writing alone. That needs at least 20,000 characters, and the model writes more than
+scraps of your own sentences only once it has a few hundred thousand.
+
+On Windows, the tokenizer is built and run inside WSL, so `g++` and `make` have to be
+installed there. `python pipeline.py check` lists anything the build is missing, with
+the command that installs it.
+
+expected output (from `python pipeline.py build --steps 1500`, with a Sherlock Holmes
+collection from Project Gutenberg standing in for your own writing):
+
+```
+[1/4] gather your writing
+  bible...
+    -> data/clean/bible.txt: 4,040,424 chars, 756,414 words
+  ...
+  detective_stories...
+    sherlock.txt (580,876 chars)
+    -> data/clean/detective_stories.txt: 580,876 chars, 107,558 words
+done in 1.3 s
+
+[2/4] mix it into training text
+  bible         4341 chunks  x1 in train
+  austen        4535 chunks  x1 in train
+  detective_stories   681 chunks  x4 in train
+...
+[3/4] train the tokenizer
+  ...
+  merges 3840, specials 3 (<bible> <detective_stories> <austen>), vocab 4099, 0.16 s -> data/tokenizer.bpe
+done in 4.0 s
+
+[4/4] train the model
+  ...
+  step 1500 | train 3.699 | val 4.152 | lr 6.0e-05 | norm 1.06 | 184,228 tok/s | mfu 34.1%
+  done   best val 4.152 at step 1500 -> data/ref\best.pt
+done in 46.4 s
+
+your model is ready: python playground.py, or python gui.py
+```
+
+`python gui.py` does the same on one screen that looks like a terminal. The left side
+lists your writing with buttons to add and remove it, shows the four steps with a
+progress bar on the one running, and writes text in any of the styles, starting from
+your own words if you give it some. The right side shows the build log and what the
+model wrote. The window uses tkinter, which comes with Python, and opens in about a
+tenth of a second.
+
 ## menu
 
 `python playground.py` opens a menu for trying each part on your own text. Run it from
@@ -203,12 +270,40 @@ Its scratch files go in `data/playground/`, which git ignores.
 
 ## options
 
-To add your own writing, copy `sources.example.txt` to `sources.local.txt` and list
-your files in it. The file is split into sections, and each section heading in square
-brackets, like `[essays]`, becomes a separate source with that name. A line under a
-heading can be a file or folder (`.pdf`, `.docx`, `.txt`, `.md`), `!name` to skip any
-file with that name, or `wattpad:<username>` to download every public story from that
-Wattpad account:
+Running `python pipeline.py -h`:
+
+```
+usage: pipeline.py [-h] {status,add,remove,check,build,gui} ...
+
+Train the model on your own writing.
+
+positional arguments:
+  {status,add,remove,check,build,gui}
+    status              list your writing and what is built
+    add                 copy files or folders into my_writing/TAG/
+    remove              delete my_writing/TAG/ (your original files stay)
+    check               check that everything the build needs is installed
+    build               gather, mix, train the tokenizer, train the model
+    gui                 open the window version
+```
+
+and `python pipeline.py build -h`:
+
+```
+  --no-public           leave out the Bible and Austen
+  --steps STEPS         most training steps, it stops early once it stops
+                        improving (default 5000)
+  --exact               train in exact fp32 mode instead of fast fp16 mode
+  --from {gather,mix,tokenize,train}
+                        start at this step
+```
+
+Writing that you'd rather not copy into `my_writing/` can be listed where it is. Copy
+`sources.example.txt` to `sources.local.txt` and list your files in it. The file is
+split into sections, and each section heading in square brackets, like `[essays]`,
+becomes a separate source with that name. A line under a heading can be a file or
+folder (`.pdf`, `.docx`, `.txt`, `.md`), `!name` to skip any file with that name, or
+`wattpad:<username>` to download every public story from that Wattpad account:
 
 ```
 [essays]
@@ -216,8 +311,8 @@ Wattpad account:
 !transcript.pdf
 ```
 
-`sources.local.txt` and everything under `data/` are listed in `.gitignore`, so your
-writing never gets committed.
+`my_writing/`, `sources.local.txt` and everything under `data/` are listed in
+`.gitignore`, so your writing never gets committed.
 
 The tokenizer is a command line tool. Running `./build/bpe -h`:
 
@@ -341,15 +436,20 @@ for line in lines:
 
 `build_corpus.py` combines the sources into one training file. It splits each source
 into chunks of about 1,000 characters and puts a tag line naming the source at the start
-of every chunk, such as `<bible>`, `<austen>`, or `<essays>` for an `[essays]`
-section. Once the model is trained, starting it with a tag should make it write in that
-source's style.
+of every chunk, such as `<bible>`, `<austen>`, or `<essays>` for an `essays` folder.
+Once the model is trained, starting it with a tag should make it write in that source's
+style.
 
 The Bible and Austen's novels have about 4.0 million characters each, so with only the
 public sources they make up half of the training text apiece. A folder of your own
 writing is usually far smaller than either, so each of your sources is repeated four
 times in the training file. The repeat counts are `REPEATS` and `LOCAL_REPEATS` at the
-top of `build_corpus.py`.
+top of `build_corpus.py`. Without the public sources nothing needs to be repeated, so
+each of your sources appears once.
+
+`pipeline.py` also picks the tokenizer's size from the amount of text. It uses 4,096
+tokens from 2 million characters up, 2,048 from 500,000, and 1,024 below that, so a
+small text isn't split into thousands of rare tokens the model sees only a few times.
 
 The last 10% of each source goes into a separate validation file, `corpus_val.txt`,
 and is never repeated or trained on. The model's error on that file shows how well it
