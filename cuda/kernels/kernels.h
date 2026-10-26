@@ -1,11 +1,15 @@
 #pragma once
 // kernels.h: one launcher per kernel, with its math.
+
+#include <cuda_runtime.h>
 //
 // Rules for every launcher:
 //   - row-major, N = B*T rows, shapes in a comment on every pointer
 //   - backward kernels ACCUMULATE (+=) into gradients, never overwrite. The
 //     training step zeroes all gradients once before backward.
 //   - shapes are checked with assert on the host before launching
+//   - the attention launchers and sgemm take an optional stream (stage 4
+//     reuses them inside a captured CUDA Graph); the default is stream 0
 //
 // Atomics (the only places results can change in the last bits between runs):
 //   encoder_backward: dwte, because the same token appears many times.
@@ -59,7 +63,7 @@ void layernorm_backward(float *dx,          // (N, C)
 void sgemm(bool transA, bool transB, int M, int N, int K, float alpha,
            const float *A, int lda, long long strideA,
            const float *B, int ldb, long long strideB,
-           float beta, float *C, int ldc, long long strideC, int batch);
+           float beta, float *C, int ldc, long long strideC, int batch, cudaStream_t stream = 0);
 // Same contract, one thread per output, no tricks: the test oracle for sgemm().
 void sgemm_naive(bool transA, bool transB, int M, int N, int K, float alpha,
                  const float *A, int lda, long long strideA,
@@ -98,30 +102,30 @@ void bias_backward(float *dbias,            // (OC)
 // of the first C columns, k is the next C, v the last C.
 void attention_permute(float *q, float *k, float *v,    // (B, H, T, D) each
                        const float *qkv,                // (B, T, 3C)
-                       int B, int T, int H, int D);
+                       int B, int T, int H, int D, cudaStream_t stream = 0);
 // In place on scores: set j > i to -inf (the dump stores -inf there), then
 // probs = softmax over each row. The row max only looks at j <= i, and the
 // diagonal is always there, so the max is never -inf.
 void causal_softmax(float *probs,           // (B, H, T, T)
                     float *scores,          // (B, H, T, T)
-                    int B, int H, int T);
+                    int B, int H, int T, cudaStream_t stream = 0);
 // y (B,H,T,D) -> atty (B,T,C), atty[b,t,h*D+d] = y[b,h,t,d]
 void attention_unpermute(float *atty,       // (B, T, C)
                          const float *y,    // (B, H, T, D)
-                         int B, int T, int H, int D);
+                         int B, int T, int H, int D, cudaStream_t stream = 0);
 // dscores[i,j] += probs[i,j] * (dprobs[i,j] - sum_k probs[i,k] * dprobs[i,k])
 // (masked spots come out 0 on their own, because probs is 0 there)
 void causal_softmax_backward(float *dscores,        // (B, H, T, T)
                              const float *dprobs,   // (B, H, T, T)
                              const float *probs,    // (B, H, T, T)
-                             int B, int H, int T);
+                             int B, int H, int T, cudaStream_t stream = 0);
 // The reverse of the two permutes, for the gradients (both +=):
 void attention_unpermute_backward(float *dy,            // (B, H, T, D)
                                   const float *datty,   // (B, T, C)
-                                  int B, int T, int H, int D);
+                                  int B, int T, int H, int D, cudaStream_t stream = 0);
 void attention_permute_backward(float *dqkv,            // (B, T, 3C)
                                 const float *dq, const float *dk, const float *dv,  // (B, H, T, D)
-                                int B, int T, int H, int D);
+                                int B, int T, int H, int D, cudaStream_t stream = 0);
 
 // The whole attention, built from the pieces above and sgemm:
 //   q, k, v = permute(qkv); scores = q @ k^T / sqrt(D); probs = causal_softmax(scores)
@@ -131,7 +135,7 @@ void attention_forward(float *atty,                     // (B, T, C)
                        float *scores, float *probs,     // (B, H, T, T) each
                        float *y,                        // (B, H, T, D)
                        const float *qkv,                // (B, T, 3C)
-                       int B, int T, int H, int D);
+                       int B, int T, int H, int D, cudaStream_t stream = 0);
 //   dy = unpermute_backward(datty); dprobs = dy @ v^T; dv = probs^T @ dy
 //   dscores = causal_softmax_backward(dprobs, probs)
 //   dq = dscores @ k / sqrt(D); dk = dscores^T @ q / sqrt(D)
@@ -144,7 +148,7 @@ void attention_backward(float *dqkv,                    // (B, T, 3C)
                         const float *datty,             // (B, T, C)
                         const float *q, const float *k, const float *v,    // (B, H, T, D)
                         const float *probs,             // (B, H, T, T)
-                        int B, int T, int H, int D);
+                        int B, int T, int H, int D, cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------- gelu.cu
 // s = sqrt(2/pi), u = s * (x + 0.044715 x^3)

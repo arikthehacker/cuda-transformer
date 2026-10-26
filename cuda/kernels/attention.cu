@@ -155,88 +155,90 @@ __global__ void causal_softmax_backward_kernel(float *dscores, const float *dpro
 
 // ---------------------------------------------------------------- launchers
 
-void attention_permute(float *q, float *k, float *v, const float *qkv, int B, int T, int H, int D)
+void attention_permute(float *q, float *k, float *v, const float *qkv, int B, int T, int H, int D, cudaStream_t stream)
 {
     assert(B > 0 && T > 0 && H > 0 && D > 0);
     long long total = static_cast<long long>(B) * H * T * D;
-    permute_kernel<<<ceil_div(total, BLOCK), BLOCK>>>(q, k, v, qkv, T, H, D, total);
+    permute_kernel<<<ceil_div(total, BLOCK), BLOCK, 0, stream>>>(q, k, v, qkv, T, H, D, total);
     CUDA_CHECK_LAUNCH();
 }
 
 void attention_permute_backward(float *dqkv, const float *dq, const float *dk, const float *dv,
-                                int B, int T, int H, int D)
+                                int B, int T, int H, int D, cudaStream_t stream)
 {
     assert(B > 0 && T > 0 && H > 0 && D > 0);
     long long total = static_cast<long long>(B) * H * T * D;
-    permute_backward_kernel<<<ceil_div(total, BLOCK), BLOCK>>>(dqkv, dq, dk, dv, T, H, D, total);
+    permute_backward_kernel<<<ceil_div(total, BLOCK), BLOCK, 0, stream>>>(dqkv, dq, dk, dv, T, H, D, total);
     CUDA_CHECK_LAUNCH();
 }
 
-void attention_unpermute(float *atty, const float *y, int B, int T, int H, int D)
+void attention_unpermute(float *atty, const float *y, int B, int T, int H, int D, cudaStream_t stream)
 {
     assert(B > 0 && T > 0 && H > 0 && D > 0);
     long long total = static_cast<long long>(B) * T * H * D;
-    unpermute_kernel<<<ceil_div(total, BLOCK), BLOCK>>>(atty, y, T, H, D, total);
+    unpermute_kernel<<<ceil_div(total, BLOCK), BLOCK, 0, stream>>>(atty, y, T, H, D, total);
     CUDA_CHECK_LAUNCH();
 }
 
-void attention_unpermute_backward(float *dy, const float *datty, int B, int T, int H, int D)
+void attention_unpermute_backward(float *dy, const float *datty, int B, int T, int H, int D, cudaStream_t stream)
 {
     assert(B > 0 && T > 0 && H > 0 && D > 0);
     long long total = static_cast<long long>(B) * T * H * D;
-    unpermute_backward_kernel<<<ceil_div(total, BLOCK), BLOCK>>>(dy, datty, T, H, D, total);
+    unpermute_backward_kernel<<<ceil_div(total, BLOCK), BLOCK, 0, stream>>>(dy, datty, T, H, D, total);
     CUDA_CHECK_LAUNCH();
 }
 
-void causal_softmax(float *probs, float *scores, int B, int H, int T)
+void causal_softmax(float *probs, float *scores, int B, int H, int T, cudaStream_t stream)
 {
     assert(B > 0 && H > 0 && T > 0);
     long long rows = static_cast<long long>(B) * H * T;
-    causal_softmax_kernel<<<ceil_div(rows, ROWS_PER_BLOCK), BLOCK>>>(probs, scores, T, rows);
+    causal_softmax_kernel<<<ceil_div(rows, ROWS_PER_BLOCK), BLOCK, 0, stream>>>(probs, scores, T, rows);
     CUDA_CHECK_LAUNCH();
 }
 
-void causal_softmax_backward(float *dscores, const float *dprobs, const float *probs, int B, int H, int T)
+void causal_softmax_backward(float *dscores, const float *dprobs, const float *probs, int B, int H, int T,
+                             cudaStream_t stream)
 {
     assert(B > 0 && H > 0 && T > 0);
     long long rows = static_cast<long long>(B) * H * T;
-    causal_softmax_backward_kernel<<<ceil_div(rows, ROWS_PER_BLOCK), BLOCK>>>(dscores, dprobs, probs, T, rows);
+    causal_softmax_backward_kernel<<<ceil_div(rows, ROWS_PER_BLOCK), BLOCK, 0, stream>>>(dscores, dprobs, probs, T,
+                                                                                         rows);
     CUDA_CHECK_LAUNCH();
 }
 
 void attention_forward(float *atty, float *q, float *k, float *v, float *scores, float *probs, float *y,
-                       const float *qkv, int B, int T, int H, int D)
+                       const float *qkv, int B, int T, int H, int D, cudaStream_t stream)
 {
     long long td = static_cast<long long>(T) * D;
     long long tt = static_cast<long long>(T) * T;
     float scale = 1.0f / sqrtf(static_cast<float>(D));
 
-    attention_permute(q, k, v, qkv, B, T, H, D);
+    attention_permute(q, k, v, qkv, B, T, H, D, stream);
     // scores = q @ k^T / sqrt(D): batch B*H, M T, N T, K D, transB
-    sgemm(false, true, T, T, D, scale, q, D, td, k, D, td, 0.0f, scores, T, tt, B * H);
-    causal_softmax(probs, scores, B, H, T);
+    sgemm(false, true, T, T, D, scale, q, D, td, k, D, td, 0.0f, scores, T, tt, B * H, stream);
+    causal_softmax(probs, scores, B, H, T, stream);
     // y = probs @ v: batch B*H, M T, N D, K T
-    sgemm(false, false, T, D, T, 1.0f, probs, T, tt, v, D, td, 0.0f, y, D, td, B * H);
-    attention_unpermute(atty, y, B, T, H, D);
+    sgemm(false, false, T, D, T, 1.0f, probs, T, tt, v, D, td, 0.0f, y, D, td, B * H, stream);
+    attention_unpermute(atty, y, B, T, H, D, stream);
 }
 
 void attention_backward(float *dqkv, float *dq, float *dk, float *dv, float *dscores, float *dprobs, float *dy,
                         const float *datty, const float *q, const float *k, const float *v, const float *probs,
-                        int B, int T, int H, int D)
+                        int B, int T, int H, int D, cudaStream_t stream)
 {
     long long td = static_cast<long long>(T) * D;
     long long tt = static_cast<long long>(T) * T;
     float scale = 1.0f / sqrtf(static_cast<float>(D));
 
-    attention_unpermute_backward(dy, datty, B, T, H, D);
+    attention_unpermute_backward(dy, datty, B, T, H, D, stream);
     // dprobs += dy @ v^T: M T, N T, K D, transB
-    sgemm(false, true, T, T, D, 1.0f, dy, D, td, v, D, td, 1.0f, dprobs, T, tt, B * H);
+    sgemm(false, true, T, T, D, 1.0f, dy, D, td, v, D, td, 1.0f, dprobs, T, tt, B * H, stream);
     // dv += probs^T @ dy: transA, M T, N D, K T
-    sgemm(true, false, T, D, T, 1.0f, probs, T, tt, dy, D, td, 1.0f, dv, D, td, B * H);
-    causal_softmax_backward(dscores, dprobs, probs, B, H, T);
+    sgemm(true, false, T, D, T, 1.0f, probs, T, tt, dy, D, td, 1.0f, dv, D, td, B * H, stream);
+    causal_softmax_backward(dscores, dprobs, probs, B, H, T, stream);
     // dq += dscores @ k / sqrt(D): M T, N D, K T
-    sgemm(false, false, T, D, T, scale, dscores, T, tt, k, D, td, 1.0f, dq, D, td, B * H);
+    sgemm(false, false, T, D, T, scale, dscores, T, tt, k, D, td, 1.0f, dq, D, td, B * H, stream);
     // dk += dscores^T @ q / sqrt(D): transA, M T, N D, K T
-    sgemm(true, false, T, D, T, scale, dscores, T, tt, q, D, td, 1.0f, dk, D, td, B * H);
-    attention_permute_backward(dqkv, dq, dk, dv, B, T, H, D);
+    sgemm(true, false, T, D, T, scale, dscores, T, tt, q, D, td, 1.0f, dk, D, td, B * H, stream);
+    attention_permute_backward(dqkv, dq, dk, dv, B, T, H, D, stream);
 }

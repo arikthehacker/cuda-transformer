@@ -181,12 +181,12 @@ static void check_sgemm(bool transA, bool transB, int M, int N, int K, int lda, 
 void sgemm(bool transA, bool transB, int M, int N, int K, float alpha,
            const float *A, int lda, long long strideA,
            const float *B, int ldb, long long strideB,
-           float beta, float *C, int ldc, long long strideC, int batch)
+           float beta, float *C, int ldc, long long strideC, int batch, cudaStream_t stream)
 {
     check_sgemm(transA, transB, M, N, K, lda, ldb, ldc, batch);
     assert(ceil_div(M, TM) <= 65535);               // gridDim.y limit
     dim3 grid(ceil_div(N, TN), ceil_div(M, TM), batch);
-    sgemm_tiled_kernel<<<grid, TILED_THREADS>>>(transA, transB, M, N, K, alpha, A, lda, strideA,
+    sgemm_tiled_kernel<<<grid, TILED_THREADS, 0, stream>>>(transA, transB, M, N, K, alpha, A, lda, strideA,
                                                 B, ldb, strideB, beta, C, ldc, strideC);
     CUDA_CHECK_LAUNCH();
 }
