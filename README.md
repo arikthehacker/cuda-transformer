@@ -31,16 +31,16 @@ expected output (from `make run`, the times change from run to run):
 
 ```
 ./build/bpe -t -i data/corpus_train.txt -n 4096 -o data/tokenizer.bpe -v
-words  29,844 unique of 1,709,937 pieces, 1,142 pairs, 0.09 s
-merge   256 / 4096   (32, 116)    -> 256     " t"           count 181,309
-merge   512 / 4096   (108, 97)    -> 512     "la"           count 3,054
+words  25,239 unique of 1,662,539 pieces, 1,136 pairs, 0.08 s
+merge   256 / 4096   (32, 116)    -> 256     " t"           count 186,339
+merge   512 / 4096   (272, 101)   -> 512     " fe"          count 3,031
 ...
-merge  4095 / 4096   (2520, 554)  -> 4095    " Perry"       count 76
-merges 3840, specials 2 (<bible> <austen>), vocab 4098, 0.15 s -> data/tokenizer.bpe
+merge  4095 / 4096   (744, 4051)  -> 4095    " clouds"      count 74
+merges 3840, specials 2 (<bible> <austen>), vocab 4098, 0.12 s -> data/tokenizer.bpe
 ./build/bpe -e -m data/tokenizer.bpe -i data/corpus_train.txt -o data/train.bin
-tokens written 2,027,109, chars per token 3.62 (bytes per token 3.66), 0.13 s -> data/train.bin
+tokens written 1,949,203, chars per token 3.76 (bytes per token 3.80), 0.10 s -> data/train.bin
 ./build/bpe -e -m data/tokenizer.bpe -i data/corpus_val.txt -o data/val.bin
-tokens written 224,728, chars per token 3.54 (bytes per token 3.57), 0.02 s -> data/val.bin
+tokens written 216,395, chars per token 3.68 (bytes per token 3.71), 0.01 s -> data/val.bin
 ```
 
 `make test` runs the tokenizer's checks. `make DEBUG=1 test` runs them again with the
@@ -91,7 +91,28 @@ by one verse per paragraph, numbered by chapter and verse (`1:1 In the beginning
 Austen's novels come from Project Gutenberg. Each novel is trimmed to the story itself,
 from its first chapter to its last line, which also removes the license text Project
 Gutenberg adds at the start and end. Project Gutenberg's markup for italics and
-illustrations is removed too.
+illustrations is removed too, along with the title page that Pride and Prejudice
+repeats between its volumes.
+
+The ebooks also break every line at about 71 characters, and a model trained on that
+learns to start a new line in the middle of a sentence. The `unwrap` function joins a
+line to the next one when the next line's first word would not have fit on it, which
+is the test a word wrapper uses. Poems and the closing lines of letters stop well short
+of the width, so they keep their line breaks:
+
+```python
+next_word = line.split(" ", 1)[0]
+if len(prev) + 1 + len(next_word) > width - WRAP_SLACK:  # the word wrap broke here
+    glue = "" if prev.endswith("—") or line.startswith("—") else " "
+    joined += glue + line
+else:                                               # a line break on purpose
+    joined += "\n" + line
+```
+
+This removes 52,308 of the 52,349 line breaks inside paragraphs. `WRAP_SLACK` is 10
+characters, because some lines in these editions wrap a few characters early, while a
+poem's lines end 15 or more characters short. An em dash at a break joins with no
+space, since Austen writes her dashes without spaces.
 
 Your own files are read as PDF, Word, or plain text. If two files contain the same
 text, for example the same essay saved twice, only one is kept.
@@ -152,7 +173,7 @@ one leading space. For example, `Let there be light,` becomes `Let`, ` there`, `
 ` light`, and `,`. Curly quotes and dashes count as punctuation, so `God’s` splits the
 same way `God's` does.
 
-Training works on the 29,844 unique words and how often each appears, instead of the
+Training works on the 25,239 unique words and how often each appears, instead of the
 1.7 million words in the text. A count is kept for every pair, along with the list of
 words that contain it, and a heap keeps the most frequent pair on top. After a merge,
 only the words in that pair's list are rewritten, and only the counts of the pairs next
