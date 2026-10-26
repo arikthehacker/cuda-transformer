@@ -22,12 +22,19 @@
 // After a kernel launch: catches bad launch configs right away. In debug
 // builds (make DEBUG=1) it also waits for the kernel, so a crash inside it
 // is reported at the right line instead of at some later CUDA call.
+//
+// A stream that is being captured into a CUDA Graph (graph.cu) cannot be
+// synced, so while g_capturing is set the debug build only checks the launch.
+inline bool g_capturing = false;
 #ifdef CUDA_DEBUG
 #define CUDA_CHECK_LAUNCH()                     \
     do                                          \
     {                                           \
         CUDA_CHECK(cudaGetLastError());         \
-        CUDA_CHECK(cudaDeviceSynchronize());    \
+        if (!g_capturing)                       \
+        {                                       \
+            CUDA_CHECK(cudaDeviceSynchronize());\
+        }                                       \
     } while (0)
 #else
 #define CUDA_CHECK_LAUNCH() CUDA_CHECK(cudaGetLastError())
