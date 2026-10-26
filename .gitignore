@@ -18,6 +18,7 @@ build/
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 
 # Editors and OS
