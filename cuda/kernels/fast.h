@@ -8,6 +8,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include "precision.h"
 
 struct StepState;           // scaler.cu below
@@ -68,25 +70,33 @@ void encoder_bwd(float *dwte, float *dwpe, const float *dres, const int *tok, in
 void bias_bwd(float *dbias, const floatX *dout, int N, int OC, float *scratch, cudaStream_t s);
 // out = gelu(in), floatX (the backward pass recomputes gelu from fc)
 void gelu_fwd(floatX *out, const floatX *in, long long n, cudaStream_t s);
-// Cross entropy over the V real columns, one block per row.
+// Cross entropy over the V real columns, one block per row. A target of -1
+// is not counted (SFT: only the answers are trained on). count points at the
+// number of targets >= 0 in GPU memory (count_targets below), nullptr = N.
 // Training: losses[n] fp32, and the logits row is OVERWRITTEN with
-//   dlogits = (softmax - onehot) * scale / N, padded columns set to 0.
-//   scale is read from GPU memory (the loss scale), so a graph can replay it.
+//   dlogits = (softmax - onehot) * scale / count, padded columns set to 0,
+//   and a row whose target is -1 gets loss 0 and dlogits 0.
+//   scale and count are read from GPU memory, so a graph can replay them.
 // Eval (grad false): losses only, logits untouched.
 void crossentropy_fused(float *losses, floatX *logits, const int *targets, int N, int V, int Vp,
-                        const float *scale, bool grad, cudaStream_t s);
-// out[0] = mean of losses[0 .. N-1], one block, fixed order
-void mean_loss(float *out, const float *losses, int N, cudaStream_t s);
+                        const float *scale, const int *count, bool grad, cudaStream_t s);
+// out[0] = sum of losses[0 .. N-1] / count (nullptr = N), one block, fixed order
+void mean_loss(float *out, const float *losses, int N, const int *count, cudaStream_t s);
+// st->n_valid = how many of targets[0 .. N-1] are >= 0, at least 1, so a
+// batch with nothing counted gives loss 0 instead of 0 / 0. One block.
+void count_targets(StepState *st, const int *targets, int N, cudaStream_t s);
 // fp32 -> floatX copy (the weight copy the GEMMs read)
 void cast_to_x(floatX *out, const float *in, long long n, cudaStream_t s);
 // floatX -> fp32 copy
 void cast_to_f(float *out, const floatX *in, long long n, cudaStream_t s);
-// The batch of step st->step from tokens on the GPU: for row b,
+// The batch of step st->step from tokens on the GPU (uint16, 2 bytes per
+// id, so 1B pretraining tokens fit in 2 GB): for row b,
 // start = starts[(st->step % nsteps) * B + b], x[b, t] = tokens[start + t],
-// y[b, t] = tokens[start + t + 1]. Every step's starts are uploaded once, so
-// a graph replay picks its own batch.
-void load_batch(int *x, int *y, const int *tokens, const int *starts, int nsteps, const StepState *st, int B, int T,
-                cudaStream_t s);
+// y[b, t] = tokens[start + t + 1], or targets[start + t] when there are SFT
+// targets (int32, -1 = not counted). Every step's starts are uploaded once,
+// so a graph replay picks its own batch.
+void load_batch(int *x, int *y, const uint16_t *tokens, const int *targets, const int *starts, int nsteps,
+                const StepState *st, int B, int T, cudaStream_t s);
 
 // ---------------------------------------------------------------- scaler.cu
 // Everything a step decides lives on the GPU, so a CUDA Graph can replay a
@@ -107,6 +117,7 @@ struct StepState
     float bc2_sqrt;         // sqrt(1 - beta2^t)
     float decay;            // 1 - lr * weight_decay (for the 2D weights)
     float loss;             // mean loss of this step
+    int n_valid;            // targets >= 0 in this step's batch (B * T outside SFT), the loss divides by it
 };
 
 struct ScheduleConfig       // the numbers finalize needs, same values as TrainConfig

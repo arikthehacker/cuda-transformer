@@ -90,7 +90,7 @@ train-cuda: $(BUILD)/train_gpt
 #               stage 3 tolerances
 # Each source file compiles once per build into build/o16 or build/o32.
 NVFLAGS16 = $(NVFLAGS) -DFP16
-FAST_SRC  = $(CU_SRC) cuda/gpt_fast.cu cuda/graph.cu
+FAST_SRC  = $(CU_SRC) cuda/gpt_fast.cu cuda/graph.cu cuda/checkpoint.cu
 GEN_SRC   = $(FAST_SRC) cuda/generator.cu tokenizer/bpe.cpp
 GEN_HDR   = $(CU_HDR) tokenizer/bpe.h
 OBJ16     = $(patsubst %,$(BUILD)/o16/%.o,$(basename $(FAST_SRC)))
@@ -115,7 +115,7 @@ $(BUILD)/o32/%.o: %.cpp $(GEN_HDR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 FAST_BIN  = $(BUILD)/test_gemm $(BUILD)/test_gemm32 $(BUILD)/test_attn $(BUILD)/test_fast $(BUILD)/test_fast32 \
-            $(BUILD)/train_fast $(BUILD)/train_fast32
+            $(BUILD)/train_fast $(BUILD)/train_fast32 $(BUILD)/test_checkpoint $(BUILD)/test_checkpoint32
 GEN_BIN   = $(BUILD)/generate $(BUILD)/generate32 $(BUILD)/test_generate $(BUILD)/test_generate32
 
 fast: $(FAST_BIN) $(GEN_BIN)
@@ -133,6 +133,12 @@ $(BUILD)/test_fast: $(BUILD)/o16/cuda/tests/test_fast.o $(OBJ16)
 	$(NVCC) $(NVFLAGS16) -o $@ $^
 
 $(BUILD)/test_fast32: $(BUILD)/o32/cuda/tests/test_fast.o $(OBJ32)
+	$(NVCC) $(NVFLAGS) -o $@ $^
+
+$(BUILD)/test_checkpoint: $(BUILD)/o16/cuda/tests/test_checkpoint.o $(OBJ16)
+	$(NVCC) $(NVFLAGS16) -o $@ $^
+
+$(BUILD)/test_checkpoint32: $(BUILD)/o32/cuda/tests/test_checkpoint.o $(OBJ32)
 	$(NVCC) $(NVFLAGS) -o $@ $^
 
 $(BUILD)/train_fast: $(BUILD)/o16/cuda/train_fast.o $(OBJ16)

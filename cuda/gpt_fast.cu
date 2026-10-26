@@ -322,8 +322,9 @@ void FastGPT::forward(bool train, float *loss_out)
         residual_layernorm_fwd(a.res2, next, next_mean, next_rstd, a.res1, proj_out, next_w, next_b, N, C, eps_ln, s);
     }
     gemm_act(EP_STORE, false, true, N, Vp, C, lnf, C, wte_x, C, logits, Vp, nullptr, nullptr, nullptr, s);
-    crossentropy_fused(losses, logits, y.ptr, N, cfg.V, Vp, &state.ptr->loss_scale, train, s);
-    mean_loss(loss_out, losses, N, s);
+    count_targets(state.ptr, y.ptr, N, s);  // N outside SFT, so the mean is the same as before stage 6
+    crossentropy_fused(losses, logits, y.ptr, N, cfg.V, Vp, &state.ptr->loss_scale, &state.ptr->n_valid, train, s);
+    mean_loss(loss_out, losses, N, &state.ptr->n_valid, s);
 }
 
 // The stage 3 attention needs fp32 in and out: in the fp16 build, qkv goes

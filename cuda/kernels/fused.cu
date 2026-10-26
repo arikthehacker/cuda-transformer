@@ -334,11 +334,26 @@ void cast_to_f(float *out, const floatX *in, long long n, cudaStream_t s)
 // three passes, so the in-place overwrite never touches a value another
 // thread still has to read. l[target] is read before the first barrier.
 __global__ void crossentropy_kernel(float *losses, floatX *logits, const int *targets, int N, int V, int Vp,
-                                    const float *scale, bool grad)
+                                    const float *scale, const int *count, bool grad)
 {
     int n = blockIdx.x;
     floatX *l = logits + static_cast<long long>(n) * Vp;
     int target = targets[n];
+    if (target < 0)                         // not counted: no loss, no gradient (the whole block takes this branch)
+    {
+        if (threadIdx.x == 0)
+        {
+            losses[n] = 0.0f;
+        }
+        if (grad)
+        {
+            for (int j = threadIdx.x; j < Vp; j += blockDim.x)
+            {
+                l[j] = from_float<floatX>(0.0f);
+            }
+        }
+        return;
+    }
     float lt = to_float(l[target]);
 
     float m = -INFINITY;
@@ -359,7 +374,7 @@ __global__ void crossentropy_kernel(float *losses, floatX *logits, const int *ta
     }
     if (grad)
     {
-        float k = *scale / N;               // loss scale, and the mean over N rows
+        float k = *scale / (count ? *count : N);    // loss scale, and the mean over the counted rows
         for (int j = threadIdx.x; j < Vp; j += blockDim.x)
         {
             float d = 0.0f;
@@ -373,7 +388,7 @@ __global__ void crossentropy_kernel(float *losses, floatX *logits, const int *ta
     }
 }
 
-__global__ void __launch_bounds__(1024) mean_loss_kernel(float *out, const float *losses, int N)
+__global__ void __launch_bounds__(1024) mean_loss_kernel(float *out, const float *losses, int N, const int *count)
 {
     float sum = 0.0f;
     for (int i = threadIdx.x; i < N; i += blockDim.x)
@@ -383,28 +398,60 @@ __global__ void __launch_bounds__(1024) mean_loss_kernel(float *out, const float
     sum = block_sum(sum);
     if (threadIdx.x == 0)
     {
-        out[0] = sum / N;
+        out[0] = sum / (count ? *count : N);
+    }
+}
+
+// One block of 1024 threads, an exact integer tree sum.
+__global__ void __launch_bounds__(1024) count_targets_kernel(StepState *st, const int *targets, int N)
+{
+    __shared__ int part[1024];
+    int c = 0;
+    for (int i = threadIdx.x; i < N; i += blockDim.x)
+    {
+        c += targets[i] >= 0 ? 1 : 0;
+    }
+    part[threadIdx.x] = c;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k /= 2)
+    {
+        if (static_cast<int>(threadIdx.x) < k)
+        {
+            part[threadIdx.x] += part[threadIdx.x + k];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        st->n_valid = max(part[0], 1);
     }
 }
 
 void crossentropy_fused(float *losses, floatX *logits, const int *targets, int N, int V, int Vp, const float *scale,
-                        bool grad, cudaStream_t s)
+                        const int *count, bool grad, cudaStream_t s)
 {
     assert(N > 0 && V > 0 && V <= Vp);
-    crossentropy_kernel<<<N, BLOCK, 0, s>>>(losses, logits, targets, N, V, Vp, scale, grad);
+    crossentropy_kernel<<<N, BLOCK, 0, s>>>(losses, logits, targets, N, V, Vp, scale, count, grad);
     CUDA_CHECK_LAUNCH();
 }
 
-void mean_loss(float *out, const float *losses, int N, cudaStream_t s)
+void mean_loss(float *out, const float *losses, int N, const int *count, cudaStream_t s)
 {
-    mean_loss_kernel<<<1, 1024, 0, s>>>(out, losses, N);
+    mean_loss_kernel<<<1, 1024, 0, s>>>(out, losses, N, count);
+    CUDA_CHECK_LAUNCH();
+}
+
+void count_targets(StepState *st, const int *targets, int N, cudaStream_t s)
+{
+    assert(N > 0);
+    count_targets_kernel<<<1, 1024, 0, s>>>(st, targets, N);
     CUDA_CHECK_LAUNCH();
 }
 
 // ---------------------------------------------------------------- batches
 
-__global__ void load_batch_kernel(int *x, int *y, const int *tokens, const int *starts, int nsteps,
-                                  const StepState *st, int B, int T)
+__global__ void load_batch_kernel(int *x, int *y, const uint16_t *tokens, const int *targets, const int *starts,
+                                  int nsteps, const StepState *st, int B, int T)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < B * T)
@@ -412,14 +459,14 @@ __global__ void load_batch_kernel(int *x, int *y, const int *tokens, const int *
         int b = idx / T, t = idx % T;
         long long start = starts[static_cast<long long>(st->step % nsteps) * B + b];
         x[idx] = tokens[start + t];
-        y[idx] = tokens[start + t + 1];
+        y[idx] = targets ? targets[start + t] : static_cast<int>(tokens[start + t + 1]);
     }
 }
 
-void load_batch(int *x, int *y, const int *tokens, const int *starts, int nsteps, const StepState *st, int B, int T,
-                cudaStream_t s)
+void load_batch(int *x, int *y, const uint16_t *tokens, const int *targets, const int *starts, int nsteps,
+                const StepState *st, int B, int T, cudaStream_t s)
 {
     assert(B > 0 && T > 0 && nsteps > 0);
-    load_batch_kernel<<<ceil_div(B * T, BLOCK), BLOCK, 0, s>>>(x, y, tokens, starts, nsteps, st, B, T);
+    load_batch_kernel<<<ceil_div(B * T, BLOCK), BLOCK, 0, s>>>(x, y, tokens, targets, starts, nsteps, st, B, T);
     CUDA_CHECK_LAUNCH();
 }

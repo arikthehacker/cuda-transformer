@@ -4,6 +4,9 @@
 //
 //   ./build/test_fast   data/ref/debug.bin [more dumps]    (fp16 build)
 //   ./build/test_fast32 data/ref/debug.bin                 (fp32 build: stage 3 tolerances)
+//   ./build/test_fast   data/ref/debug.bin data/ref/debug_chat_masked.bin
+//                       a dump with -1 targets (reference/dump.py --masked): the
+//                       loss and dlogits count only the targets >= 0 (SFT)
 //
 // Every gradient comes out multiplied by the loss scale S (65,536, a power
 // of two, so dividing by it is exact). The AdamW check runs on the dump's
@@ -179,6 +182,28 @@ static void dump_checks(const Dump &d, const ModelConfig &cfg, bool flash)
     model.grads.zero(model.stream);
     model.forward(true, &model.state.ptr->loss);
     model.backward();
+    const Record &tg = d.at("targets");
+    int counted = 0;
+    for (int t : tg.i)
+    {
+        counted += t >= 0 ? 1 : 0;
+    }
+    if (counted < static_cast<int>(tg.i.size()))
+    {
+        table_header("masked targets: " + to_string(counted) + " of " + to_string(tg.i.size()) + " counted");
+        StepState ms = model.read_state();
+        check(ms.n_valid == counted, "n_valid is the count of targets >= 0 (" + to_string(ms.n_valid) + ")");
+        vector<float> dlx = download_view(model.act("logits"), model.stream);
+        bool zero_rows = true;
+        for (size_t n = 0; n < tg.i.size(); n++)
+        {
+            for (int j = 0; tg.i[n] < 0 && j < cfg.Vp; j++)
+            {
+                zero_rows = zero_rows && dlx[n * cfg.Vp + j] == 0.0f;
+            }
+        }
+        check(zero_rows, "every row with target -1 has dlogits exactly 0");
+    }
     table_header("backward (" + mode + "): activation gradients kept by the fast model, then every parameter "
                  "gradient (/ S)");
     vector<float> dl = scaled(download_view(model.act("logits"), model.stream), 1.0f / SCALE);
@@ -389,37 +414,60 @@ static void batch_checks()
 {
     printf("\nload_batch: every step picks its own batch from GPU memory\n");
     const int B = 3, T = 8, NSTEPS = 5, NTOK = 200;
-    vector<int> tokens(NTOK), starts(NSTEPS * B);
+    vector<uint16_t> tokens(NTOK);
+    vector<int> starts(NSTEPS * B), targets(NTOK);
     for (int i = 0; i < NTOK; i++)
     {
-        tokens[i] = (i * 37) % 101;
+        tokens[i] = static_cast<uint16_t>(65535 - (i * 37) % 101);  // ids above 32,767: uint16, not int16
+        targets[i] = i % 3 == 0 ? -1 : (i * 11) % 97;
     }
     for (int i = 0; i < NSTEPS * B; i++)
     {
         starts[i] = (i * 53) % (NTOK - T - 1);
     }
-    DeviceInts dt(NTOK), ds(NSTEPS * B), x(B * T), y(B * T);
+    DeviceArray<uint16_t> dt(NTOK);
+    DeviceInts dtg(NTOK), ds(NSTEPS * B), x(B * T), y(B * T);
     dt.upload(tokens.data(), NTOK);
+    dtg.upload(targets.data(), NTOK);
     ds.upload(starts.data(), NSTEPS * B);
     DeviceArray<StepState> st(1);
-    bool ok = true;
+    bool ok = true, ok_sft = true;
     for (int step : {0, 3, 7})              // 7 wraps around to 2
     {
         StepState h = initial_state(1.0f);
         h.step = step;
         st.upload(&h, 1);
-        load_batch(x.ptr, y.ptr, dt.ptr, ds.ptr, NSTEPS, st.ptr, B, T, 0);
+        load_batch(x.ptr, y.ptr, dt.ptr, nullptr, ds.ptr, NSTEPS, st.ptr, B, T, 0);
         vector<int> hx = x.download(), hy = y.download();
+        load_batch(x.ptr, y.ptr, dt.ptr, dtg.ptr, ds.ptr, NSTEPS, st.ptr, B, T, 0);
+        vector<int> sx = x.download(), sy = y.download();
         for (int b = 0; b < B; b++)
         {
             int start = starts[(step % NSTEPS) * B + b];
             for (int t = 0; t < T; t++)
             {
                 ok = ok && hx[b * T + t] == tokens[start + t] && hy[b * T + t] == tokens[start + t + 1];
+                ok_sft = ok_sft && sx[b * T + t] == tokens[start + t] && sy[b * T + t] == targets[start + t];
             }
         }
     }
     check(ok, "x and y match the host's picks at steps 0, 3 and 7 (wraps)");
+    check(ok_sft, "with SFT targets: y = targets[start + t], -1 kept");
+}
+
+// A batch with nothing counted: loss 0, gradients 0, nothing inf, not skipped.
+static void empty_batch_checks(const Dump &d, const ModelConfig &cfg)
+{
+    printf("\na batch whose targets are all -1\n");
+    FastGPT model(cfg, d.B, d.T, config_from_header(d), SCALE);
+    setup(model, d);
+    vector<int> none(static_cast<size_t>(model.N), -1);
+    model.y.upload(none.data(), none.size());
+    model.train_step();
+    StepState st = model.read_state();
+    check(st.n_valid == 1, "n_valid is clamped to 1, so nothing divides by 0");
+    check(st.loss == 0.0f && st.found_inf == 0 && st.skipped == 0, "loss 0, no inf, the step is not skipped");
+    check(st.grad_norm == 0.0f, "every gradient is 0");
 }
 
 int main(int argc, char *argv[])
@@ -448,6 +496,7 @@ int main(int argc, char *argv[])
             scaler_checks(d, cfg);
             graph_checks(d, cfg);
             weights_checks(d, cfg);
+            empty_batch_checks(d, cfg);
         }
     }
     batch_checks();
