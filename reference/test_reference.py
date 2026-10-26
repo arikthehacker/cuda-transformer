@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from . import dump
+from . import dump, export
 from .config import DUMP_BATCH, TOKENIZER_PATH, VAL_PATH, ModelConfig, TrainConfig, tiny_model_config
 from .data import Batches, fixed_batches, load_tokens
 from .model import GPT
@@ -231,3 +231,27 @@ def test_load_tokens_checks(tmp_path):
     short.write_bytes(np.array([0x31455042, 1, 4], dtype="<u4").tobytes() + ids.tobytes())
     with pytest.raises(ValueError, match="header says 4 tokens"):
         load_tokens(str(short))
+
+
+def test_weights_round_trip(tmp_path):
+    """export.py: model -> weights.bin -> model gives the same logits. The file
+    order is named_parameters() order, which the CUDA side assumes (layout.h)."""
+    cfg = tiny_model_config(vocab_size())
+    model = GPT(cfg)
+    assert [n for n, _ in model.named_parameters()] == [n for n, _ in export.param_shapes(cfg)]
+    path = str(tmp_path / "weights.bin")
+    params = {n: p.detach().numpy() for n, p in model.named_parameters()}
+    count = export.write_weights(path, cfg, params)
+    assert count == model.num_params()
+    assert os.path.getsize(path) == 48 + 4 * count
+    cfg2, model2 = export.load_into(path)
+    assert (cfg2.vocab_size, cfg2.padded_vocab, cfg2.n_ctx, cfg2.n_layer, cfg2.n_head, cfg2.n_embd) == \
+        (cfg.vocab_size, cfg.padded_vocab, cfg.n_ctx, cfg.n_layer, cfg.n_head, cfg.n_embd)
+    assert abs(cfg2.ln_eps - cfg.ln_eps) < 1e-12
+    x = torch.randint(0, cfg.vocab_size, (2, cfg.n_ctx))
+    with torch.no_grad():
+        assert torch.equal(model(x)[0], model2(x)[0])
+    export.write_weights(path, cfg, params, fp16=True)
+    _, half = export.read_weights(path)
+    for name, a in params.items():
+        assert np.allclose(half[name], a, rtol=1e-3, atol=1e-4), name

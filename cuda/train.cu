@@ -14,13 +14,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "common.h"
 #include "config.h"
+#include "data.h"
 #include "dump.h"
 #include "gpt.h"
 
@@ -30,66 +30,12 @@ static void usage(const char *prog)
 {
     printf("Usage: %s [OPTIONS ...]\n", prog);
     printf("  -d file       dump with the model sizes and starting weights (default data/ref/debug_full.bin)\n");
+    printf("  -w file       start from these weights instead (weights.bin, same sizes as the dump)\n");
     printf("  -n #          optimizer steps (default 5000)\n");
     printf("  -b #          sequences per step (default 16)\n");
     printf("  -e #          steps between evals (default 250)\n");
     printf("  -o dir        folder for cuda_log.csv (default data/ref)\n");
     printf("  -h            print this help message\n");
-}
-
-static string with_commas(long long v)
-{
-    string digits = to_string(v);
-    string out;
-    for (size_t k = 0; k < digits.size(); k++)
-    {
-        if (k > 0 && (digits.size() - k) % 3 == 0)
-        {
-            out += ',';
-        }
-        out += digits[k];
-    }
-    return out;
-}
-
-// The BPE1 token file from stage 1: magic, version, count, uint16 ids.
-static vector<int> load_tokens(const string &path, int V)
-{
-    ifstream in(path, ios::binary);
-    if (!in)
-    {
-        fprintf(stderr, "error: cannot open %s (run: make run)\n", path.c_str());
-        exit(1);
-    }
-    vector<unsigned char> buf((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
-    auto u32 = [&](size_t at)
-    {
-        return static_cast<uint32_t>(buf[at]) | (static_cast<uint32_t>(buf[at + 1]) << 8) |
-               (static_cast<uint32_t>(buf[at + 2]) << 16) | (static_cast<uint32_t>(buf[at + 3]) << 24);
-    };
-    if (buf.size() < 12 || u32(0) != 0x31455042u || u32(4) != 1)
-    {
-        fprintf(stderr, "error: %s is not a BPE1 token file\n", path.c_str());
-        exit(1);
-    }
-    size_t count = u32(8);
-    if (buf.size() != 12 + 2 * count)
-    {
-        fprintf(stderr, "error: %s is the wrong size for %zu tokens\n", path.c_str(), count);
-        exit(1);
-    }
-    vector<int> ids(count);
-    for (size_t k = 0; k < count; k++)
-    {
-        ids[k] = buf[12 + 2 * k] | (buf[13 + 2 * k] << 8);
-        if (ids[k] >= V)
-        {
-            fprintf(stderr, "error: %s has id %d at position %zu, the model only has %d ids\n",
-                    path.c_str(), ids[k], k, V);
-            exit(1);
-        }
-    }
-    return ids;
 }
 
 // x = tokens[s : s + T], y = tokens[s + 1 : s + T + 1], for each start s
@@ -110,15 +56,19 @@ static void fill_batch(vector<int> &x, vector<int> &y, const vector<int> &tokens
 int main(int argc, char *argv[])
 {
     string dump_path = "data/ref/debug_full.bin";
+    string weights_path;
     string out_dir = "data/ref";
     TrainConfig tc;
     int opt = 0;
-    while ((opt = getopt(argc, argv, "d:n:b:e:o:h")) != -1)
+    while ((opt = getopt(argc, argv, "d:w:n:b:e:o:h")) != -1)
     {
         switch (opt)
         {
         case 'd':
             dump_path = optarg;
+            break;
+        case 'w':
+            weights_path = optarg;
             break;
         case 'n':
             tc.max_steps = atoi(optarg);
@@ -160,23 +110,21 @@ int main(int argc, char *argv[])
 
     GPT model(cfg, B, T);
     model.load_params(d);
+    if (!weights_path.empty())
+    {
+        model.load(weights_path);
+    }
     size_t n_params = model.params.count;
     printf("model  %s parameters | L %d H %d C %d n_ctx %d | V %d Vp %d | weights from %s\n",
            with_commas(static_cast<long long>(n_params)).c_str(), cfg.L, cfg.H, cfg.C, cfg.n_ctx, cfg.V, cfg.Vp,
-           dump_path.c_str());
+           weights_path.empty() ? dump_path.c_str() : weights_path.c_str());
     printf("data   train %s tokens | val %s tokens | %s tokens per step\n",
            with_commas(static_cast<long long>(train_tokens.size())).c_str(),
            with_commas(static_cast<long long>(val_tokens.size())).c_str(),
            with_commas(static_cast<long long>(B) * T).c_str());
 
     // Val: the same evenly spaced starts as fixed_batches() in reference/data.py
-    int val_total = tc.eval_batches * B;
-    long long last = static_cast<long long>(val_tokens.size()) - T - 1;
-    vector<long long> val_starts(val_total);
-    for (int i = 0; i < val_total; i++)
-    {
-        val_starts[i] = val_total == 1 ? 0 : (i * last) / (val_total - 1);
-    }
+    vector<long long> val_start = val_starts(val_tokens.size(), T, tc.eval_batches * B);
 
     vector<int> hx(static_cast<size_t>(B) * T);
     vector<int> hy(static_cast<size_t>(B) * T);
@@ -188,7 +136,7 @@ int main(int argc, char *argv[])
         double sum = 0.0;
         for (int c = 0; c < tc.eval_batches; c++)
         {
-            fill_batch(hx, hy, val_tokens, val_starts, static_cast<size_t>(c) * B, B, T);
+            fill_batch(hx, hy, val_tokens, val_start, static_cast<size_t>(c) * B, B, T);
             x.upload(hx.data(), hx.size());
             y.upload(hy.data(), hy.size());
             sum += model.forward(x.ptr, y.ptr, B, T);

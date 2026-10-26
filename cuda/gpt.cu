@@ -10,6 +10,7 @@
 
 #include "dump.h"
 #include "kernels/kernels.h"
+#include "weights.h"
 
 using namespace std;
 
@@ -265,6 +266,22 @@ void GPT::load_params(const Dump &d)
         }
         upload(r, params.ptr + s.offset);
     }
+    grads.zero();
+    m.zero();
+    v.zero();
+    step = 0;
+}
+
+void GPT::load(const string &path)
+{
+    Weights w = read_weights(path);
+    if (w.cfg.V != cfg.V || w.cfg.Vp != cfg.Vp || w.cfg.n_ctx != cfg.n_ctx || w.cfg.L != cfg.L ||
+        w.cfg.H != cfg.H || w.cfg.C != cfg.C)
+    {
+        fprintf(stderr, "error: %s is a different model size than this one\n", path.c_str());
+        exit(1);
+    }
+    params.upload(w.params.data(), w.params.size());
     grads.zero();
     m.zero();
     v.zero();

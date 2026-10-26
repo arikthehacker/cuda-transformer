@@ -33,6 +33,7 @@ struct GPT
     float *dA(const std::string &name) const;   // its gradient
 
     void load_params(const Dump &d);           // from the dump's param records
+    void load(const std::string &path);        // from weights.bin (reference/export.py or train_fast)
     float forward(const int *tok, const int *targets, int B, int T);   // returns the loss (0 without targets)
     void zero_grad();
     void backward(const int *tok, const int *targets, int B, int T);
