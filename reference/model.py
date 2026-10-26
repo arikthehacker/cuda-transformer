@@ -224,7 +224,9 @@ class GPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
                 rec: Recorder | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Returns (logits (B, T, Vp), loss or None). The loss is the mean over
-        all B*T tokens and only looks at the V real columns."""
+        the targets that are not -1 (all B*T of them outside SFT) and only looks
+        at the V real columns. A batch with every target -1 has no mean: torch
+        gives nan, so SFT rows start at conversation starts (reference/chat.py)."""
         V = self.cfg.vocab_size
         if rec is not None and self.fast:
             raise ValueError("recording needs exact mode: fast mode has no scores, probs or LayerNorm stats")
@@ -233,7 +235,7 @@ class GPT(nn.Module):
             logits = _rec(rec, "logits", F.linear(x, self.wte))                 # (B, T, Vp) tied: x @ wte.T
             loss = None
             if targets is not None:
-                loss = F.cross_entropy(logits[..., :V].reshape(-1, V), targets.reshape(-1))   # scalar
+                loss = F.cross_entropy(logits[..., :V].reshape(-1, V), targets.reshape(-1), ignore_index=-1)
                 loss = _rec(rec, "loss", loss)
         return logits, loss
 

@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from . import dump, export
-from .config import DUMP_BATCH, TOKENIZER_PATH, VAL_PATH, ModelConfig, TrainConfig, tiny_model_config
+from .config import DUMP_BATCH, TOKENIZER_PATH, VAL_PATH, ModelConfig, TrainConfig, sizes, tiny_model_config
 from .data import Batches, fixed_batches, load_tokens
 from .model import GPT
 from .tokenizer import load_bpe
@@ -255,3 +255,73 @@ def test_weights_round_trip(tmp_path):
     _, half = export.read_weights(path)
     for name, a in params.items():
         assert np.allclose(half[name], a, rtol=1e-3, atol=1e-4), name
+
+
+# ------------------------------------------------------------------ stage 6
+
+def test_chat_param_count():
+    cfg = ModelConfig.for_vocab(16387, **sizes("chat"))
+    assert (cfg.padded_vocab, cfg.n_ctx, cfg.n_layer, cfg.n_embd) == (16448, 512, 8, 512)
+    assert GPT(cfg).num_params() == 33_903_616          # 25.2M in the blocks, 8.4M in wte, 0.26M in wpe
+    assert ModelConfig.for_vocab(4100, **sizes("small")) == ModelConfig.for_vocab(4100)
+
+
+def test_masked_loss_is_the_mean_over_counted_targets():
+    cfg = tiny_model_config(vocab_size())
+    model = fresh(cfg)
+    x, y = one_batch(cfg, 4)
+    masked = dump.mask_targets(y, 3)
+    keep = masked >= 0
+    assert 0 < int(keep.sum()) < y.numel() and not keep[1].any()
+    logits, loss = model(x, masked)
+    each = F.cross_entropy(logits[..., :cfg.vocab_size].reshape(-1, cfg.vocab_size).double(),
+                           y.reshape(-1), reduction="none")                     # (B*T,)
+    want = each[keep.reshape(-1)].mean()
+    assert abs(loss.item() - want.item()) < 1e-5
+    logits.retain_grad()                                # through model.py: a -1 target gives its row no gradient
+    loss.backward()
+    assert (logits.grad[1] == 0).all() and (logits.grad[~keep] == 0).all()
+    assert (logits.grad[keep][:, :cfg.vocab_size] != 0).any(dim=-1).all()
+
+
+def test_sft_batches(monkeypatch):
+    from . import data
+
+    rng = np.random.default_rng(1)
+    toks = rng.integers(0, 500, size=5000).astype(np.uint16)
+    tgt = np.where(rng.random(5000) < 0.5, -1, toks.astype(np.int64)).astype(np.int32)
+    starts = np.array([0, 700, 1500, 3000, 4000])
+    on_gpu = Batches(toks, 3, 64, DEVICE, 5, tgt, starts)
+    monkeypatch.setattr(data, "GPU_TOKENS_MAX", 100)    # the path a 1B token file takes
+    on_cpu = Batches(toks, 3, 64, DEVICE, 5, tgt, starts)
+    assert on_gpu.on_gpu and not on_cpu.on_gpu
+    for _ in range(4):
+        (x1, y1), (x2, y2) = on_gpu.next(), on_cpu.next()
+        assert torch.equal(x1, x2) and torch.equal(y1, y2)
+        s = on_gpu.last_starts.tolist()
+        assert all(v in starts for v in s)
+        assert x1[0].tolist() == toks[s[0]:s[0] + 64].tolist()
+        assert y1[0].tolist() == tgt[s[0]:s[0] + 64].tolist()
+    plain_cpu = Batches(toks, 3, 64, DEVICE, 5)         # no targets: the same batches as before stage 6
+    monkeypatch.setattr(data, "GPU_TOKENS_MAX", 1 << 26)
+    plain_gpu = Batches(toks, 3, 64, DEVICE, 5)
+    assert plain_gpu.on_gpu and not plain_cpu.on_gpu
+    a, b = plain_gpu.next(), plain_cpu.next()
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    assert torch.equal(a[0][:, 1:], a[1][:, :-1])
+    vb = fixed_batches(toks, 2, 64, 3, DEVICE, tgt, starts)
+    assert len(vb) == 3 and vb[0][0][0].tolist() == toks[:64].tolist()
+    assert vb[-1][1][-1].tolist() == tgt[4000:4064].tolist()
+
+
+def test_export_init_matches_a_fresh_train_run(tmp_path):
+    path = str(tmp_path / "init.bin")
+    if not os.path.exists(TOKENIZER_PATH):
+        pytest.skip("needs data/tokenizer.bpe")
+    export.main(["--init", "--config", "small", "--vocab-from", TOKENIZER_PATH, "--out", path])
+    exact_mode(TrainConfig().seed)
+    model = GPT(ModelConfig.for_vocab(vocab_size()))
+    cfg, params = export.read_weights(path)
+    assert cfg.same_size(model.cfg)
+    for name, p in model.named_parameters():
+        assert np.array_equal(params[name], p.detach().numpy()), name

@@ -6,6 +6,11 @@
     python -m reference.export --read data/ref/weights.bin      print the header and every tensor's shape
     python -m reference.export --from-dump data/ref/debug.bin --out data/ref/weights_debug.bin
                                                                 a dump's starting weights (for the tests)
+    python -m reference.export --weights data/chat/sft/weights.bin --fp16 --out demo/weights16.bin
+                                                                a weights.bin as fp16 (cuda/train_fast writes fp32)
+    python -m reference.export --init --config chat --vocab-from data/chat/tokenizer.bpe --out data/chat/init.bin
+                                                                a fresh GPT(cfg), seeded like train.py, so
+                                                                cuda/train_fast starts from PyTorch's exact init
 
 cuda/train_fast writes the same format after training, and reference/sample.py
 takes a .bin in --ckpt, so a model trained by either side can be sampled by
@@ -31,7 +36,7 @@ import sys
 
 import numpy as np
 
-from .config import REF_DIR, ModelConfig
+from .config import CONFIGS, REF_DIR, TOKENIZER_PATH, ModelConfig, TrainConfig, sizes
 
 MAGIC = 0x57545047
 VERSION = 1
@@ -150,7 +155,37 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--fp16", action="store_true", help="store the values as float16")
     p.add_argument("--read", metavar="FILE", help="print what is inside FILE and stop")
     p.add_argument("--from-dump", metavar="DUMP", help="take the weights from a reference/dump.py file instead")
+    p.add_argument("--weights", metavar="FILE", help="take the weights from a weights.bin file instead")
+    p.add_argument("--init", action="store_true",
+                   help="write a fresh model's weights (torch.manual_seed(TrainConfig.seed), then GPT(cfg))")
+    p.add_argument("--config", choices=sorted(CONFIGS), default="small", help="the model size for --init")
+    p.add_argument("--vocab-from", metavar="FILE", default=TOKENIZER_PATH,
+                   help=f"the tokenizer whose vocabulary size --init uses (default {TOKENIZER_PATH})")
     args = p.parse_args(argv)
+
+    if args.init:
+        import torch
+
+        from .model import GPT
+        from .tokenizer import load_bpe
+
+        vocab, tags = load_bpe(args.vocab_from)
+        cfg = ModelConfig.for_vocab(len(vocab), **sizes(args.config))
+        torch.manual_seed(TrainConfig().seed)       # what train.py's exact_mode and fast_mode do first
+        model = GPT(cfg)                            # built on the CPU: the same numbers on any machine
+        params = {name: t.detach().float().numpy() for name, t in model.named_parameters()}
+        n = write_weights(args.out, cfg, params, args.fp16)
+        print(f"fresh {args.config} model, L {cfg.n_layer} H {cfg.n_head} C {cfg.n_embd} n_ctx {cfg.n_ctx} "
+              f"V {cfg.vocab_size} Vp {cfg.padded_vocab} ({len(tags)} tags: {' '.join(tags)}) -> {args.out}: "
+              f"{n:,} values, {os.path.getsize(args.out):,} bytes")
+        return
+
+    if args.weights:
+        cfg, params = read_weights(args.weights)
+        n = write_weights(args.out, cfg, params, args.fp16)
+        print(f"{args.weights} -> {args.out}: {n:,} values, {'fp16' if args.fp16 else 'fp32'}, "
+              f"{os.path.getsize(args.out):,} bytes")
+        return
 
     if args.from_dump:
         cfg, params = dump_params(args.from_dump)

@@ -13,6 +13,19 @@ VAL_PATH = "data/val.bin"
 REF_DIR = "data/ref"
 
 
+# Model sizes by name: (n_layer, n_head, n_embd, n_ctx). "small" is the default
+# ModelConfig below (stages 1 to 5), "chat" is stage 6.
+CONFIGS = {"small": (6, 6, 384, 256), "chat": (8, 8, 512, 512)}
+
+
+def sizes(name: str) -> dict[str, int]:
+    """The ModelConfig keyword arguments of a preset, for ModelConfig.for_vocab(V, **sizes(name))."""
+    if name not in CONFIGS:
+        raise ValueError(f"no model size {name!r} (have: {', '.join(CONFIGS)})")
+    n_layer, n_head, n_embd, n_ctx = CONFIGS[name]
+    return {"n_layer": n_layer, "n_head": n_head, "n_embd": n_embd, "n_ctx": n_ctx}
+
+
 def pad_to(n: int, multiple: int = 64) -> int:
     """Smallest multiple of `multiple` that is >= n."""
     return ((n + multiple - 1) // multiple) * multiple
@@ -38,6 +51,12 @@ class ModelConfig:
     def head_size(self) -> int:
         """D = C / H."""
         return self.n_embd // self.n_head
+
+    def same_size(self, other: ModelConfig) -> bool:
+        """Every size equal. ln_eps is left out: weights.bin stores it as float32,
+        so 1e-5 comes back as 9.99999975e-06 (the same number once it is float32)."""
+        return (self.vocab_size, self.padded_vocab, self.n_ctx, self.n_layer, self.n_head, self.n_embd) == \
+            (other.vocab_size, other.padded_vocab, other.n_ctx, other.n_layer, other.n_head, other.n_embd)
 
     @classmethod
     def for_vocab(cls, vocab_size: int, **sizes: int) -> ModelConfig:
@@ -69,6 +88,11 @@ class TrainConfig:
     # cores (fp32 accumulate, which is what PyTorch uses for fp16 matmuls).
     peak_tflops_fp32: float = 10.0     # RTX 2080 fp32, about 10
     peak_tflops_fp16: float = 40.0     # RTX 2080 fp16 tensor cores, about 40
+
+
+# --sft (reference/train.py, cuda/train_fast): fine-tuning a pretrained model
+# on answers wants a smaller step than pretraining, with a short warmup.
+SFT_TRAIN = {"lr": 1e-4, "min_lr": 1e-5, "warmup_steps": 100}
 
 
 # The answer key model (reference/dump.py), also used by the tests.

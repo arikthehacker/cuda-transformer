@@ -4,6 +4,17 @@
     python -m reference.train --fast         fp16 autocast + SDPA (the baseline stage 4 races)
     python -m reference.train --resume       continue from data/ref/last.pt
 
+Stage 6, the chat model:
+
+    python -m reference.train --fast --config chat --data data/chat/pretrain --warmup 2000 --out data/chat/ref
+    python -m reference.train --fast --init data/chat/pre/weights.bin --data data/chat/sft --sft --out data/chat/ref_sft
+
+--data PREFIX reads PREFIX_train.bin and PREFIX_val.bin (and the tokenizer.bpe
+next to them). --init starts from a weights.bin, with its sizes. --sft trains
+only on the answers (reference/chat.py): rows start at conversation starts,
+the loss is the mean over the counted targets, and lr is 1e-4 with warmup 100
+and a fresh AdamW.
+
 Writes data/ref/best.pt (best val loss), data/ref/last.pt (every eval),
 data/ref/log.csv (one row per step) and data/ref/samples.txt.
 """
@@ -20,10 +31,12 @@ import time
 
 import torch
 
-from .config import REF_DIR, TOKENIZER_PATH, TRAIN_PATH, VAL_PATH, ModelConfig, TrainConfig
+import numpy as np
+
+from .config import CONFIGS, REF_DIR, SFT_TRAIN, TOKENIZER_PATH, TRAIN_PATH, VAL_PATH, ModelConfig, TrainConfig, sizes
 from .data import Batches, fixed_batches, load_tokens
 from .model import GPT
-from .tokenizer import decode, load_bpe, prompt
+from .tokenizer import NEWLINE, decode, load_bpe, prompt
 
 
 # ------------------------------------------------------------------ modes
@@ -74,10 +87,20 @@ def lr_at(step: int, tc: TrainConfig) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: GPT, batches: list[tuple[torch.Tensor, torch.Tensor]]) -> float:
-    """Mean loss over the fixed val batches."""
-    losses = [model(x, y)[1].float() for x, y in batches]
-    return torch.stack(losses).mean().item()
+def evaluate(model: GPT, batches: list[tuple[torch.Tensor, torch.Tensor]], masked: bool = False) -> float:
+    """Mean loss over the fixed val batches. masked (SFT): each batch's mean
+    weighted by its counted targets, so the result is the mean over every
+    counted target, the same number cuda/train_fast --sft prints."""
+    if not masked:
+        losses = [model(x, y)[1].float() for x, y in batches]
+        return torch.stack(losses).mean().item()
+    total, count = 0.0, 0
+    for x, y in batches:
+        n = int((y >= 0).sum())
+        if n:
+            total += model(x, y)[1].float().item() * n
+            count += n
+    return total / max(1, count)
 
 
 def train_step(model: GPT, opt: torch.optim.Optimizer, scaler, x: torch.Tensor, y: torch.Tensor,
@@ -104,10 +127,13 @@ def mfu(num_params: int, tokens_per_sec: float, peak_tflops: float) -> float:
 # ------------------------------------------------------------------ checkpoints and samples
 
 def save_checkpoint(path: str, model: GPT, opt, scaler, tc: TrainConfig, step: int,
-                    best_val: float, best_step: int, evals_since_best: int, batches: Batches) -> None:
-    """Model, optimizer, both configs, step, best val and every RNG state.
+                    best_val: float, best_step: int, evals_since_best: int, batches: Batches,
+                    run: dict | None = None) -> None:
+    """Model, optimizer, both configs, step, best val and every RNG state, and
+    `run` (data prefix, tokenizer, sft) so --resume reads the same data.
     Written to a temp file first, so a crash never leaves half a checkpoint."""
     state = {
+        "run": run or {},
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),
         "scaler": scaler.state_dict(),
@@ -139,24 +165,51 @@ def load_checkpoint(path: str) -> dict:
         return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def question_prompts(tokens: np.ndarray, tags: dict[str, int], starts: np.ndarray, n: int = 3) -> list[list[int]]:
+    """The first question of n conversations spread over `starts`, each up to
+    and including "<assistant>\\n": what the model answers in an SFT sample."""
+    assistant = tags["<assistant>"]
+    out = []
+    for k in sorted({int(starts[(i * (len(starts) - 1)) // max(1, n - 1)]) for i in range(n)}):
+        ids = tokens[k:k + 512].tolist()
+        if assistant in ids:
+            end = ids.index(assistant) + 1
+            out.append(ids[:end] + [NEWLINE])
+    return out
+
+
 def write_samples(model: GPT, vocab: list[bytes], tags: dict[str, int], step: int,
-                  tc: TrainConfig, path: str) -> None:
-    """A short sample from each of the first three tags, printed and appended to `path`.
-    Each sample has its own generator, so sampling never changes the training run."""
+                  tc: TrainConfig, path: str, prompts: list[list[int]] | None = None) -> None:
+    """A short sample from each of the first three tags (or from each of
+    `prompts`, cut at the first tag the model writes), printed and appended to
+    `path`. Each sample has its own generator, so sampling never changes the
+    training run."""
     device = model.wte.device
+    names = ["<web>"] if "<web>" in tags else list(tags)[:3]       # the chat pretrain text only has <web>
+    items = [("question", ids) for ids in prompts] if prompts else [(name, prompt(tags, name)) for name in names]
+    tag_ids = set(tags.values())
     with open(path, "a", encoding="utf-8") as f:
-        for name in list(tags)[:3]:
+        for name, ids in items:
             gen = torch.Generator(device=device)
             gen.manual_seed(tc.seed + step)
-            idx = torch.tensor([prompt(tags, name)], dtype=torch.long, device=device)    # (1, 2)
-            out = model.generate(idx, tc.sample_tokens, 0.8, 40, generator=gen)          # (1, 2 + n)
-            text = decode(vocab, out[0].tolist())
+            idx = torch.tensor([ids], dtype=torch.long, device=device)                 # (1, t)
+            out = model.generate(idx, tc.sample_tokens, 0.8, 40, generator=gen)[0].tolist()
+            new = out[len(ids):]
+            if prompts:
+                stop = next((i for i, t in enumerate(new) if t in tag_ids), None)
+                new = new if stop is None else new[:stop + 1]
+            text = decode(vocab, ids + new)
             block = f"----- step {step}, {name}\n{text}\n"
             print(block)
             f.write(block + "\n")
 
 
 # ------------------------------------------------------------------ main
+
+def _e(x: float) -> str:
+    """6e-04 -> 6e-4"""
+    return f"{x:.0e}".replace("e-0", "e-")
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     tc = TrainConfig()
@@ -171,11 +224,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "cuda/train_fast -s FILE trains on the same batches (costs a little speed)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
                    help="cuda or cpu (default: cuda when there is one)")
+    p.add_argument("--config", choices=sorted(CONFIGS), default=None,
+                   help="model size: small (L 6, C 384, n_ctx 256, the default) or chat (L 8, C 512, n_ctx 512)")
+    p.add_argument("--data", metavar="PREFIX",
+                   help="PREFIX_train.bin and PREFIX_val.bin, e.g. data/chat/pretrain (default data/train.bin, data/val.bin)")
+    p.add_argument("--tokenizer", metavar="FILE",
+                   help=f"default {TOKENIZER_PATH}, or tokenizer.bpe in the folder of --data")
+    p.add_argument("--init", metavar="FILE", help="start from this weights.bin (and its sizes), not a fresh init")
+    p.add_argument("--sft", action="store_true",
+                   help=f"train on the answers only (reference/chat.py); lr {_e(SFT_TRAIN['lr'])}, "
+                        f"warmup {SFT_TRAIN['warmup_steps']}")
+    p.add_argument("--lr", type=float, help=f"peak learning rate (default {_e(tc.lr)}, --sft {_e(SFT_TRAIN['lr'])})")
+    p.add_argument("--min-lr", type=float,
+                   help=f"learning rate at the end (default {_e(tc.min_lr)}, --sft {_e(SFT_TRAIN['min_lr'])})")
+    p.add_argument("--warmup", type=int, help=f"warmup steps (default {tc.warmup_steps}; 2000 for the chat pretrain)")
     return p.parse_args(argv)
+
+
+RUN_KEYS = ("data", "tokenizer", "sft")     # saved in every checkpoint, so --resume reads the same data
+
+
+def data_paths(args: argparse.Namespace) -> tuple[str, str, str]:
+    """(train .bin, val .bin, tokenizer) for --data and --tokenizer."""
+    if args.data:
+        tok = args.tokenizer or os.path.join(os.path.dirname(args.data) or ".", "tokenizer.bpe")
+        return f"{args.data}_train.bin", f"{args.data}_val.bin", os.path.normpath(tok)
+    return TRAIN_PATH, VAL_PATH, os.path.normpath(args.tokenizer or TOKENIZER_PATH)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    for key in ("data", "tokenizer"):           # one spelling of a path, so --resume can compare them
+        if getattr(args, key):
+            setattr(args, key, os.path.normpath(getattr(args, key)))
+    if args.resume and args.init:
+        raise SystemExit("--init starts a new run from a weights.bin; --resume continues last.pt, so leave --init out")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")    # emoji in samples on a cp1252 console
 
@@ -186,10 +269,27 @@ def main(argv: list[str] | None = None) -> None:
         tc = TrainConfig(**ckpt["train_config"])
         if ckpt["fast"] != args.fast:
             raise SystemExit(f"last.pt was trained with fast={ckpt['fast']}, so pass the same --fast setting")
+        saved = ckpt.get("run", {})
+        for key in RUN_KEYS:
+            given = getattr(args, key)
+            if key in saved and given not in (None, False) and given != saved[key]:
+                raise SystemExit(f"last.pt was trained with --{key} {saved[key]}, not {given}")
+            if key in saved:
+                setattr(args, key, saved[key])
+    elif args.sft:
+        tc = dataclasses.replace(tc, **SFT_TRAIN)
     if args.steps is not None:
         tc = dataclasses.replace(tc, max_steps=args.steps)
     if args.batch is not None:
         tc = dataclasses.replace(tc, batch_size=args.batch)
+    if args.lr is not None:
+        tc = dataclasses.replace(tc, lr=args.lr)
+    if args.min_lr is not None:
+        tc = dataclasses.replace(tc, min_lr=args.min_lr)
+    if args.warmup is not None:
+        tc = dataclasses.replace(tc, warmup_steps=args.warmup)
+    train_path, val_path, tok_path = data_paths(args)
+    run = {"data": args.data, "tokenizer": tok_path, "sft": args.sft}
 
     if args.fast:
         fast_mode(tc.seed)
@@ -198,23 +298,54 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device(args.device)
     os.makedirs(args.out, exist_ok=True)
 
-    vocab, tags = load_bpe(TOKENIZER_PATH)
-    cfg = ModelConfig(**ckpt["model_config"]) if ckpt else ModelConfig.for_vocab(len(vocab))
-    if cfg.vocab_size != len(vocab):
-        raise SystemExit(f"{TOKENIZER_PATH} has {len(vocab)} ids but the model expects {cfg.vocab_size}")
+    vocab, tags = load_bpe(tok_path)
+    init = None
+    if ckpt:
+        cfg = ModelConfig(**ckpt["model_config"])
+        if args.config and not ModelConfig.for_vocab(cfg.vocab_size, **sizes(args.config)).same_size(cfg):
+            raise SystemExit(f"last.pt is L {cfg.n_layer} H {cfg.n_head} C {cfg.n_embd} n_ctx {cfg.n_ctx}, "
+                             f"not the {args.config} size")
+    elif args.init:
+        from .export import read_weights
 
-    train_tokens = load_tokens(TRAIN_PATH)
-    val_tokens = load_tokens(VAL_PATH)
-    for name, toks in ((TRAIN_PATH, train_tokens), (VAL_PATH, val_tokens)):
+        cfg, init = read_weights(args.init)
+        if args.config and not ModelConfig.for_vocab(cfg.vocab_size, **sizes(args.config)).same_size(cfg):
+            raise SystemExit(f"{args.init} is L {cfg.n_layer} H {cfg.n_head} C {cfg.n_embd} n_ctx {cfg.n_ctx}, "
+                             f"not the {args.config} size")
+    else:
+        cfg = ModelConfig.for_vocab(len(vocab), **sizes(args.config or "small"))
+    if cfg.vocab_size != len(vocab):
+        raise SystemExit(f"{tok_path} has {len(vocab)} ids but the model expects {cfg.vocab_size}")
+
+    train_tokens = load_tokens(train_path)
+    val_tokens = load_tokens(val_path)
+    for name, toks in ((train_path, train_tokens), (val_path, val_tokens)):
         if int(toks.max()) >= cfg.vocab_size:
             raise SystemExit(f"{name} has id {int(toks.max())} but the tokenizer has {cfg.vocab_size} ids, "
                              "so re-run make run")
 
-    model = GPT(cfg, fast=args.fast).to(device)     # weights made on the CPU, then moved
-    opt = model.optimizer(tc)
+    model = GPT(cfg, fast=args.fast)                # weights made on the CPU, then moved
+    if init is not None:
+        model.load_state_dict({k: torch.from_numpy(a.copy()) for k, a in init.items()}, strict=True)
+    model = model.to(device)
+    opt = model.optimizer(tc)                       # always a fresh AdamW, --init or not
     scaler = make_scaler(args.fast and device.type == "cuda")
-    batches = Batches(train_tokens, tc.batch_size, cfg.n_ctx, device, tc.seed)
-    val_batches = fixed_batches(val_tokens, tc.batch_size, cfg.n_ctx, tc.eval_batches, device)
+    prompts = None
+    if args.sft:
+        from .chat import prepare
+
+        sft = {}
+        for split, toks in (("train", train_tokens), ("val", val_tokens)):
+            y, st, c = prepare(toks, tags, cfg.n_ctx)
+            sft[split] = (y.astype(np.int32), st)
+            print(f"sft    {split}: {c['conversations']:,} conversations, {c['whole']:,} whole, {c['cut']:,} cut "
+                  f"at a turn boundary, {c['dropped']:,} dropped | {c['counted_targets']:,} counted targets")
+        batches = Batches(train_tokens, tc.batch_size, cfg.n_ctx, device, tc.seed, *sft["train"])
+        val_batches = fixed_batches(val_tokens, tc.batch_size, cfg.n_ctx, tc.eval_batches, device, *sft["val"])
+        prompts = question_prompts(val_tokens, tags, sft["val"][1])
+    else:
+        batches = Batches(train_tokens, tc.batch_size, cfg.n_ctx, device, tc.seed)
+        val_batches = fixed_batches(val_tokens, tc.batch_size, cfg.n_ctx, tc.eval_batches, device)
 
     start_step = 0
     best_val = float("inf")
@@ -243,8 +374,9 @@ def main(argv: list[str] | None = None) -> None:
           f"n_ctx {cfg.n_ctx} | V {cfg.vocab_size} Vp {cfg.padded_vocab}")
     print(f"data   train {len(train_tokens):,} tokens | val {len(val_tokens):,} tokens | "
           f"{tokens_per_step:,} tokens per step")
-    print(f"mode   {mode} on {device}" + (f", resuming at step {start_step}" if ckpt else ""))
-    val = evaluate(model, val_batches)
+    print(f"mode   {mode} on {device}" + (f", resuming at step {start_step}" if ckpt else "")
+          + (f", from {args.init}" if init is not None else "") + (", sft (answers only)" if args.sft else ""))
+    val = evaluate(model, val_batches, args.sft)
     print(f"step {start_step:4d} | val {val:.3f} | ln(V) = {math.log(cfg.vocab_size):.3f}")
 
     cuda = device.type == "cuda"
@@ -309,7 +441,7 @@ def main(argv: list[str] | None = None) -> None:
                 timed_steps += window_steps
                 timed_secs += secs
 
-            val = evaluate(model, val_batches)
+            val = evaluate(model, val_batches, args.sft)
             losses = [r[1].item() for r in rows]
             for i, (s, l, n, r_lr, a, b) in enumerate(rows):
                 last = i == len(rows) - 1
@@ -332,14 +464,14 @@ def main(argv: list[str] | None = None) -> None:
             if val < best_val:
                 best_val, best_step, evals_since_best = val, step, 0
                 save_checkpoint(os.path.join(args.out, "best.pt"), model, opt, scaler, tc,
-                                step, best_val, best_step, evals_since_best, batches)
+                                step, best_val, best_step, evals_since_best, batches, run)
             else:
                 evals_since_best += 1
             save_checkpoint(os.path.join(args.out, "last.pt"), model, opt, scaler, tc,
-                            step, best_val, best_step, evals_since_best, batches)
+                            step, best_val, best_step, evals_since_best, batches, run)
 
             if tc.sample_every and step % tc.sample_every == 0:
-                write_samples(model, vocab, tags, step, tc, os.path.join(args.out, "samples.txt"))
+                write_samples(model, vocab, tags, step, tc, os.path.join(args.out, "samples.txt"), prompts)
             if tc.patience and evals_since_best >= tc.patience:
                 print(f"val has not improved for {evals_since_best} evals, stopping early")
                 stop = True

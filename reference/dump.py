@@ -5,6 +5,14 @@ with every value written to data/ref/debug.bin for the stage 3 CUDA tests.
     python -m reference.dump --full                   default size -> data/ref/debug_full.bin
     python -m reference.dump --read data/ref/debug.bin            list what is inside
     python -m reference.dump --compare data/ref/debug.bin mine.bin   error table
+    python -m reference.dump --config chat --masked   tiny model, chat tokenizer, -1 targets
+                                                      -> data/ref/debug_chat_masked.bin
+
+--config chat takes the vocabulary and tokens of stage 6 (data/chat/tokenizer.bpe,
+data/chat/pretrain_val.bin); with --full it also takes the chat model size.
+--masked sets about half the targets to -1 (seeded), and every target of row 1,
+so the dump holds what SFT needs: a loss over the counted targets only, zero
+gradient rows for the rest, and a row with nothing counted at all.
 
 Tiny model: L 2, H 4, C 64, n_ctx 64, B 4, T 64, V from tokenizer.bpe padded
 to 64s. Exact mode, fixed seed, the first evenly spaced batch of val.bin.
@@ -65,7 +73,7 @@ import struct
 import numpy as np
 import torch
 
-from .config import DUMP_BATCH, REF_DIR, TOKENIZER_PATH, VAL_PATH, ModelConfig, TrainConfig, tiny_model_config
+from .config import DUMP_BATCH, REF_DIR, TOKENIZER_PATH, VAL_PATH, ModelConfig, TrainConfig, sizes, tiny_model_config
 from .data import fixed_batches, load_tokens
 from .model import GPT, Recorder
 from .tokenizer import load_bpe
@@ -76,11 +84,30 @@ FLOAT32 = 0
 INT32 = 1
 
 
+# What --config picks besides the size: (tokenizer, tokens for the batch).
+DUMP_DATA = {"small": (TOKENIZER_PATH, VAL_PATH),
+             "chat": ("data/chat/tokenizer.bpe", "data/chat/pretrain_val.bin")}
+
+
+def mask_targets(y: torch.Tensor, seed: int) -> torch.Tensor:
+    """About half of y set to -1 (seeded), and all of row 1 when there are
+    two rows or more. Row 0 always keeps at least one target, so the batch
+    has something to count."""
+    gen = torch.Generator().manual_seed(seed)
+    drop = torch.rand(y.shape, generator=gen) < 0.5                            # (B, T)
+    if y.shape[0] > 1:
+        drop[1] = True
+    drop[0, 0] = False
+    return torch.where(drop.to(y.device), torch.full_like(y, -1), y)
+
+
 def build_records(cfg: ModelConfig, tc: TrainConfig, tokens: np.ndarray, batch_size: int,
-                  device: str = "cpu", perturb: bool = False) -> tuple[dict, dict[str, torch.Tensor]]:
+                  device: str = "cpu", perturb: bool = False,
+                  masked: bool = False) -> tuple[dict, dict[str, torch.Tensor]]:
     """Run the answer key and return (header, records), records in file order.
     perturb adds noise (std 0.1) to every 1D parameter, so biases and LayerNorm
-    parameters are not 0 and 1 (see the top of this file)."""
+    parameters are not 0 and 1 (see the top of this file). masked sets about
+    half the targets to -1, which the loss skips (see mask_targets)."""
     exact_mode(tc.seed)
     model = GPT(cfg)
     if perturb:
@@ -92,6 +119,8 @@ def build_records(cfg: ModelConfig, tc: TrainConfig, tokens: np.ndarray, batch_s
     model = model.to(device)
     T = cfg.n_ctx
     x, y = fixed_batches(tokens, batch_size, T, 1, device)[0]                   # (B, T), (B, T)
+    if masked:
+        y = mask_targets(y, tc.seed + 2)
 
     records: dict[str, torch.Tensor] = {}
     records["config.ln_eps"] = torch.tensor(cfg.ln_eps, dtype=torch.float32)
@@ -237,6 +266,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--compare", nargs=2, metavar=("REF", "OTHER"), help="error table of OTHER against REF")
     p.add_argument("--tol", type=float, default=1e-4, help="relative error that counts as a mismatch (default 1e-4)")
     p.add_argument("--plain", action="store_true", help="tiny dump without the noise on biases and LayerNorm")
+    p.add_argument("--config", choices=sorted(DUMP_DATA), default="small",
+                   help="whose tokenizer and tokens: small (stages 1 to 5) or chat (stage 6)")
+    p.add_argument("--masked", action="store_true", help="about half the targets -1, as in SFT")
     args = p.parse_args(argv)
 
     if args.read:
@@ -252,13 +284,17 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\n{bad} tensor(s) over tolerance" if bad else "\nevery tensor within tolerance")
         raise SystemExit(1 if bad else 0)
 
-    vocab, _ = load_bpe(TOKENIZER_PATH)
-    cfg = ModelConfig.for_vocab(len(vocab)) if args.full else tiny_model_config(len(vocab))
-    out = args.out or os.path.join(REF_DIR, "debug_full.bin" if args.full else "debug.bin")
+    tok_path, tokens_path = DUMP_DATA[args.config]
+    vocab, _ = load_bpe(tok_path)
+    cfg = ModelConfig.for_vocab(len(vocab), **sizes(args.config)) if args.full else tiny_model_config(len(vocab))
+    name = "debug" + ("_full" if args.full else "") + ("_chat" if args.config == "chat" else "") + \
+        ("_masked" if args.masked else "")
+    out = args.out or os.path.join(REF_DIR, name + ".bin")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     perturb = not args.full and not args.plain      # the full dump stays the true starting weights
-    header, records = build_records(cfg, TrainConfig(), load_tokens(VAL_PATH), DUMP_BATCH, args.device, perturb)
+    header, records = build_records(cfg, TrainConfig(), load_tokens(tokens_path), DUMP_BATCH, args.device,
+                                    perturb, args.masked)
     write_dump(out, header, records)
 
     _, back = read_dump(out)                        # read it straight back
@@ -266,8 +302,10 @@ def main(argv: list[str] | None = None) -> None:
         np.array_equal(records[k].cpu().numpy(), back[k]) for k in records)
     if not same:
         raise SystemExit(f"{out}: reading the file back did not give the same tensors")
+    counted = int((records["targets"] >= 0).sum())
     print(f"wrote {out}: {len(records)} records, {os.path.getsize(out) / 1e6:.1f} MB, "
-          f"loss {records['loss'].item():.4f} (ln V = {np.log(cfg.vocab_size):.4f}), read back identical")
+          f"loss {records['loss'].item():.4f} (ln V = {np.log(cfg.vocab_size):.4f}), "
+          f"{counted} of {records['targets'].numel()} targets counted, read back identical")
 
 
 if __name__ == "__main__":
