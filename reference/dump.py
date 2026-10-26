@@ -10,6 +10,13 @@ Tiny model: L 2, H 4, C 64, n_ctx 64, B 4, T 64, V from tokenizer.bpe padded
 to 64s. Exact mode, fixed seed, the first evenly spaced batch of val.bin.
 No gradient clipping before the AdamW step.
 
+In the tiny dump every 1D parameter (biases and LayerNorm w, b) gets random
+noise with std 0.1 added. A fresh model has every bias at 0 and every
+LayerNorm at w 1, b 0, and then a kernel that forgets a bias, or swaps w and
+b, still matches. --plain turns the noise off. The --full dump never adds it:
+it holds the exact starting weights of reference/train.py, and train.cu starts
+from them.
+
 debug.bin, little endian:
   char[8]   "GPTREF1\\0"
   uint32    V, Vp, n_ctx, L, H, C, B, T
@@ -70,10 +77,19 @@ INT32 = 1
 
 
 def build_records(cfg: ModelConfig, tc: TrainConfig, tokens: np.ndarray, batch_size: int,
-                  device: str = "cpu") -> tuple[dict, dict[str, torch.Tensor]]:
-    """Run the answer key and return (header, records), records in file order."""
+                  device: str = "cpu", perturb: bool = False) -> tuple[dict, dict[str, torch.Tensor]]:
+    """Run the answer key and return (header, records), records in file order.
+    perturb adds noise (std 0.1) to every 1D parameter, so biases and LayerNorm
+    parameters are not 0 and 1 (see the top of this file)."""
     exact_mode(tc.seed)
-    model = GPT(cfg).to(device)
+    model = GPT(cfg)
+    if perturb:
+        gen = torch.Generator().manual_seed(tc.seed + 1)
+        with torch.no_grad():
+            for p in model.parameters():
+                if p.dim() == 1:
+                    p.add_(0.1 * torch.randn(p.shape, generator=gen))
+    model = model.to(device)
     T = cfg.n_ctx
     x, y = fixed_batches(tokens, batch_size, T, 1, device)[0]                   # (B, T), (B, T)
 
@@ -220,6 +236,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--read", metavar="FILE", help="list the header and records of FILE")
     p.add_argument("--compare", nargs=2, metavar=("REF", "OTHER"), help="error table of OTHER against REF")
     p.add_argument("--tol", type=float, default=1e-4, help="relative error that counts as a mismatch (default 1e-4)")
+    p.add_argument("--plain", action="store_true", help="tiny dump without the noise on biases and LayerNorm")
     args = p.parse_args(argv)
 
     if args.read:
@@ -240,7 +257,8 @@ def main(argv: list[str] | None = None) -> None:
     out = args.out or os.path.join(REF_DIR, "debug_full.bin" if args.full else "debug.bin")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
-    header, records = build_records(cfg, TrainConfig(), load_tokens(VAL_PATH), DUMP_BATCH, args.device)
+    perturb = not args.full and not args.plain      # the full dump stays the true starting weights
+    header, records = build_records(cfg, TrainConfig(), load_tokens(VAL_PATH), DUMP_BATCH, args.device, perturb)
     write_dump(out, header, records)
 
     _, back = read_dump(out)                        # read it straight back
