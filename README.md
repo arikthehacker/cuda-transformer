@@ -165,6 +165,42 @@ validation loss rises again after step 3,250, once the model starts memorizing t
 training text. At 34,387 tokens per second it runs at 61% of the speed of PyTorch's
 exact mode, before any speed tuning.
 
+## menu
+
+`python playground.py` opens a menu for trying each part on your own text. Run it from
+the repo root with the Python that has PyTorch. On Windows, the tokenizer and the CUDA
+programs are Linux builds, so the playground runs them through WSL. On start it prints:
+
+```
+cuda-transformer playground
+try each part on your own text. 0 goes back, Ctrl+C quits.
+
+main menu
+---------
+  1. tokenizer       see how your text splits into tokens
+  2. model           generate text, and see what surprises the model
+  3. CUDA            the CUDA tests and a short CUDA training run
+  4. training data   sources, sizes and a random chunk
+  0. quit
+menu choice:
+```
+
+- **tokenizer** sends your text through `build/bpe` and shows each token in its own
+  colored box, with the token count and a check that decoding gives your text back. It
+  also looks up token ids, searches the vocabulary, and lists the longest tokens.
+- **model** loads a model saved by `reference/train.py` in `data/ref/`, or trains a
+  quick one in fast mode. It writes text from a tag and an opening of your own, or
+  scores your text by coloring each token by how likely the model found it. Its chat
+  turns each message into a line of dialogue in an Austen novel, like
+  `“Do you walk out today?” said Mr. Darcy.`, and the model writes the next paragraph
+  as the reply. The model has never seen a chat, so this is the closest it gets to one.
+- **CUDA** checks that `nvcc` and the GPU work, runs `make test-cuda`, and trains with
+  the CUDA code for a few hundred steps.
+- **training data** shows the size of each source and prints a random chunk of the
+  training text.
+
+Its scratch files go in `data/playground/`, which git ignores.
+
 ## options
 
 To add your own writing, copy `sources.example.txt` to `sources.local.txt` and list
