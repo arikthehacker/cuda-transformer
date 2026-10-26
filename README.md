@@ -102,6 +102,69 @@ He was a woman whose spirit of mind might have been risen from the folly of a ch
 [the model started a new chunk: <bible>]
 ```
 
+The CUDA version builds with NVIDIA's CUDA Toolkit. Under WSL, only the toolkit gets
+installed, from NVIDIA's repository for WSL, because the Windows driver already gives
+WSL the GPU and a Linux driver must not be installed on top of it:
+
+```
+wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get -y install cuda-toolkit
+export PATH=/usr/local/cuda/bin:$PATH
+python -m reference.dump
+python -m reference.dump --full
+make test-cuda
+make train-cuda
+```
+
+The two dump commands write the answer key the CUDA tests compare against.
+
+expected output (from `make test-cuda`, with most rows of each table left out):
+
+```
+./build/test_kernels data/ref/debug.bin
+data/ref/debug.bin: V 4098 Vp 4160 n_ctx 64 L 2 H 4 C 64, batch B 4 T 64
+...
+all kernels match the dump
+./build/test_gpt data/ref/debug.bin data/ref/debug_full.bin
+...
+==== data/ref/debug_full.bin: V 4098 Vp 4160 n_ctx 256 L 6 H 6 C 384, batch B 4 T 256
+...
+backward, every grad.* record (activations in backward order, then parameters)
+  name                                   shape                    max abs     max rel
+  grad.loss                              ()                     0.000e+00   0.000e+00
+  grad.logits                            (4, 256, 4160)         5.821e-11   5.961e-08
+  grad.ln_f                              (4, 256, 384)          4.147e-10   4.369e-06
+...
+the whole model matches the dump
+```
+
+expected output (from `make train-cuda`):
+
+```
+./build/train_gpt
+model  12,343,296 parameters | L 6 H 6 C 384 n_ctx 256 | V 4098 Vp 4160 | weights from data/ref/debug_full.bin
+data   train 1,949,203 tokens | val 216,395 tokens | 4,096 tokens per step
+step    0 | val 8.366 | ln(V) = 8.318
+step  250 | train 5.740 | val 5.006 | lr 6.0e-04 | norm 0.83 | 35,049 tok/s
+step  500 | train 4.533 | val 4.626 | lr 5.9e-04 | norm 0.83 | 34,887 tok/s
+...
+step 3000 | train 2.902 | val 3.819 | lr 2.6e-04 | norm 1.32 | 34,221 tok/s
+step 3250 | train 2.820 | val 3.807 | lr 2.2e-04 | norm 1.34 | 34,140 tok/s
+...
+step 5000 | train 2.411 | val 3.874 | lr 6.0e-05 | norm 1.69 | 34,130 tok/s
+speed  34,387 tok/s over 4990 timed steps -> data/ref/cuda_log.csv
+```
+
+The CUDA model starts from the same weights as `reference/train.py`, so both start at
+a validation loss of 8.366, and at step 3,000 they reach 3.819 and 3.818. The curves
+are close but not identical, because the two pick their random training batches with
+different random number generators. The CUDA trainer does not stop early, so its
+validation loss rises again after step 3,250, once the model starts memorizing the
+training text. At 34,387 tokens per second it runs at 61% of the speed of PyTorch's
+exact mode, before any speed tuning.
+
 ## options
 
 To add your own writing, copy `sources.example.txt` to `sources.local.txt` and list
@@ -160,6 +223,29 @@ python -m reference.sample --tag bible austen --seed 1 2    # four samples
 python -m reference.dump                                    # tiny model -> data/ref/debug.bin
 python -m reference.dump --full                             # full size -> data/ref/debug_full.bin
 python -m reference.dump --compare data/ref/debug.bin mine.bin   # error table
+```
+
+The CUDA trainer takes flags too. Running `./build/train_gpt -h`:
+
+```
+Usage: ./build/train_gpt [OPTIONS ...]
+  -d file       dump with the model sizes and starting weights (default data/ref/debug_full.bin)
+  -n #          optimizer steps (default 5000)
+  -b #          sequences per step (default 16)
+  -e #          steps between evals (default 250)
+  -o dir        folder for cuda_log.csv (default data/ref)
+  -h            print this help message
+```
+
+`make sanitize-cuda` runs the kernel tests under NVIDIA's `compute-sanitizer`, which
+reports any out of bounds memory access (memcheck) and any two threads racing on the
+same shared memory (racecheck). Under WSL it only starts once Windows lets debuggers
+attach to the GPU. That takes two registry values, added from an administrator
+terminal on Windows:
+
+```
+REG ADD HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm /f /v EnableDebugInterface /t REG_DWORD /d 1
+REG ADD "HKLM\SOFTWARE\NVIDIA Corporation\GPUDebugger" /f /v EnableInterface /t REG_DWORD /d 1
 ```
 
 ## how it works
@@ -330,14 +416,53 @@ has to be the natural log of the vocabulary size, changing a later token can nev
 change an earlier prediction, the model has to be able to memorize a single batch, and
 PyTorch's `gradcheck` has to agree with the backward pass in 64-bit floats.
 
+### CUDA
+
+`cuda/` is the same model in C++ and CUDA, in 32-bit floats. Every layer has a GPU
+kernel, a function that runs on the graphics card, for its forward pass and another for
+its backward pass, one `.cu` file per operation in `cuda/kernels/`. All the weights sit
+back to back in one block of GPU memory, in the same order as the dump, and the
+gradients and the two AdamW buffers each get one more block with the same layout. Every
+intermediate value has a buffer named after its record in the dump, so a test compares
+the two by name.
+
+Every matrix multiply in the model, attention included, goes through one function,
+`sgemm`, modeled on cuBLAS's strided batched multiply. Each linear layer is
+three calls to it, and passing `beta = 1` makes the backward ones add into their
+gradient instead of overwriting it:
+
+```cpp
+// dinp (N,IC) += dout (N,OC) @ W (OC,IC):  M N, N IC, K OC, beta 1
+sgemm(false, false, N, IC, OC, 1.0f, dout, OC, 0, w, IC, 0, 1.0f, dinp, IC, 0, 1);
+// dW (OC,IC) += dout^T @ inp:  transA, M OC, N IC, K N, beta 1
+sgemm(true, false, OC, IC, N, 1.0f, dout, OC, 0, inp, IC, 0, 1.0f, dw, IC, 0, 1);
+```
+
+The fast `sgemm` loads 64 by 16 tiles into shared memory and gives each thread 4 by 4
+outputs. A simple version with one thread per output stays in the code as its test,
+and the two give identical results on every shape tested.
+
+`cuda/tests/test_kernels.cu` runs each kernel on inputs taken straight from the dump,
+so one bug can't hide behind another. When a value feeds two places, its gradient is
+the sum of two paths, and the test separates them by subtraction: the first
+LayerNorm's own share of `grad.emb` is `grad.emb - grad.h.0.res1`. In the small dump,
+`reference/dump.py` adds random noise to every bias and LayerNorm weight, because at
+their starting values of 0 and 1 a kernel that forgets a bias still matches.
+`cuda/tests/test_gpt.cu` then runs the whole model on both dumps and compares every
+recorded value, every gradient and the weights after one AdamW step, 462 comparisons
+in all. The largest difference at the full size is 4.4e-6 of a tensor's largest value,
+against a limit of 1e-4.
+
+One slice is compared differently. The key bias, the middle third of each
+`attn.c_attn.b`, adds the same amount to every score in a row, and softmax ignores
+that, so its true gradient is 0 and the dump holds only rounding noise there. That
+slice's AdamW update is checked against an absolute limit of 1e-6.
+
 ## plan
 
-The data scripts, the tokenizer and the PyTorch reference model are written. The rest
-is built in this order:
+The data scripts, the tokenizer, the PyTorch reference model and the 32-bit CUDA
+version are written. The last step:
 
-3. **CUDA in 32-bit floats.** Each layer of the model gets a GPU kernel (a function that
-   runs on the graphics card) for its forward pass and one for its backward pass. Each
-   kernel's output has to match the reference model's dump.
 4. **Fast CUDA.** Matrix multiplication runs on the tensor cores and is written in
    inline PTX, NVIDIA's assembly language for its GPUs. Attention runs as one combined
    kernel. Training uses fp16, a 16-bit float format, with loss scaling, which
