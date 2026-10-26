@@ -46,10 +46,17 @@ def get(url):
     return data.decode("utf-8")
 
 
+def read_exact(path):
+    """Read a text file with its line endings unchanged. Path.read_text() only
+    accepts newline= from Python 3.13 on, so this uses open() instead."""
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
 def fetch(url, cache_name=None):
     # newline="" keeps line endings exactly as downloaded (Windows would add \r).
     if cache_name and (RAW / cache_name).exists():
-        return (RAW / cache_name).read_text(encoding="utf-8", newline="")
+        return read_exact(RAW / cache_name)
     text = get(url)
     if cache_name:
         (RAW / cache_name).write_text(text, encoding="utf-8", newline="")
@@ -208,7 +215,7 @@ def html_to_text(fragment):
 def chapter_text(part_id):
     cache = RAW / "wattpad" / f"{part_id}.txt"
     if cache.exists():
-        return cache.read_text(encoding="utf-8", newline="")
+        return read_exact(cache)
     pages, prev = [], None
     for page in range(1, 50):
         body = get(f"https://www.wattpad.com/apiv2/storytext?id={part_id}&page={page}")
