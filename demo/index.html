@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiny GPT in the browser</title>
+<style>
+:root {
+    --paper: #f6f1ea;
+    --card: #fffdf9;
+    --ink: #2b2622;
+    --soft: #6f655d;
+    --line: #e3d9cd;
+    --accent: #a85c6f;
+    --accent-ink: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --paper: #1d1a18;
+        --card: #262220;
+        --ink: #efe7de;
+        --soft: #a89c91;
+        --line: #3a342f;
+        --accent: #d48a9c;
+        --accent-ink: #1d1a18;
+    }
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+main { max-width: 860px; margin: 0 auto; padding: 40px 16px 64px; }
+h1 { font-size: 28px; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 4px; }
+.sub { color: var(--soft); margin: 0 0 28px; }
+.controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 14px 18px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px;
+}
+label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--soft); }
+select, input[type=number] {
+    font: inherit; color: var(--ink); background: var(--paper);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+}
+input[type=range] { accent-color: var(--accent); }
+.value { color: var(--ink); font-weight: 600; }
+.check { flex-direction: row; align-items: center; gap: 8px; }
+.buttons { display: flex; gap: 10px; align-items: end; }
+button {
+    font: inherit; font-weight: 600; border-radius: 999px; padding: 9px 20px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+}
+button.quiet { background: transparent; color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+#out {
+    margin-top: 22px; min-height: 320px; white-space: pre-wrap; overflow-wrap: anywhere;
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px;
+    font: 18px/1.65 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+}
+#out .tag { color: var(--accent); font-weight: 600; }
+.stats { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; color: var(--soft); font-size: 14px; }
+.stats b { color: var(--ink); font-weight: 600; }
+.files { margin-top: 26px; font-size: 14px; color: var(--soft); }
+.files summary { cursor: pointer; }
+.files label { margin-top: 10px; }
+#status { margin-top: 10px; font-size: 14px; color: var(--soft); }
+</style>
+</head>
+<body>
+<main>
+    <h1>Tiny GPT, running in your browser</h1>
+    <p class="sub">A small transformer, decoding one token at a time with a KV cache.
+        Everything runs locally in WebAssembly.</p>
+
+    <div class="controls">
+        <label>Start from
+            <select id="tag"></select>
+        </label>
+        <label>Temperature <span class="value" id="tempv">0.8</span>
+            <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.8">
+        </label>
+        <label>Top k
+            <input id="topk" type="number" min="0" max="5000" value="40">
+        </label>
+        <label>New tokens
+            <input id="count" type="number" min="1" max="5000" value="300">
+        </label>
+        <label>Seed
+            <input id="seed" type="number" min="0" value="1">
+        </label>
+        <label class="check"><input id="keep" type="checkbox"> keep going past the next tag</label>
+        <div class="buttons">
+            <button id="go" disabled>Generate</button>
+            <button id="stop" class="quiet" disabled>Stop</button>
+        </div>
+    </div>
+
+    <div id="out"></div>
+    <div class="stats">
+        <span>tokens <b id="ntok">0</b></span>
+        <span>speed <b id="speed">-</b></span>
+        <span>cache refills <b id="refills">0</b></span>
+        <span>model <b id="model">loading</b></span>
+    </div>
+    <div id="status">Loading forward.wasm, weights16.bin and tokenizer.bpe ...</div>
+
+    <details class="files">
+        <summary>Use other files</summary>
+        <label>weights.bin (fp16 or fp32, from reference/export.py or train_fast)
+            <input id="wfile" type="file">
+        </label>
+        <label>tokenizer.bpe
+            <input id="tfile" type="file">
+        </label>
+    </details>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let wasm = null, mem = null, cfg = null, vocab = null, specials = [], firstSpecial = 0;
+let running = false;
+
+// ---- tokenizer.bpe: merges build the byte strings, specials come after them
+function parseTokenizer(text) {
+    const lines = text.split("\n");
+    if (!lines[0].startsWith("bpe v1")) throw new Error("not a tokenizer.bpe file");
+    const merges = parseInt(lines[1].split(" ")[1], 10);
+    const v = [];
+    for (let b = 0; b < 256; b++) v.push(new Uint8Array([b]));
+    for (let i = 0; i < merges; i++) {
+        const [a, b] = lines[2 + i].split(" ").map(Number);
+        const joined = new Uint8Array(v[a].length + v[b].length);
+        joined.set(v[a]);
+        joined.set(v[b], v[a].length);
+        v.push(joined);
+    }
+    const nspec = parseInt(lines[2 + merges].split(" ")[1], 10);
+    const enc = new TextEncoder();
+    const spec = [];
+    for (let k = 0; k < nspec; k++) {
+        const name = lines[3 + merges + k].replace(/\r$/, "");
+        spec.push(name);
+        v.push(enc.encode(name));
+    }
+    return { vocab: v, specials: spec, firstSpecial: 256 + merges };
+}
+
+// ---- weights.bin into wasm memory, then load()
+function loadWeights(bytes) {
+    const ptr = wasm.alloc(bytes.byteLength);
+    if (!ptr) throw new Error("out of memory for the weights");
+    new Uint8Array(wasm.memory.buffer, ptr, bytes.byteLength).set(new Uint8Array(bytes));
+    const status = wasm.load(ptr, bytes.byteLength);
+    const why = ["", "not a weights.bin file", "another weights.bin version", "the sizes do not add up", "out of memory"];
+    if (status !== 0) throw new Error("load(): " + (why[status] || status));
+    cfg = { V: wasm.config(0), Vp: wasm.config(1), n_ctx: wasm.config(2), L: wasm.config(3), H: wasm.config(4), C: wasm.config(5) };
+    $("model").textContent = `L ${cfg.L}, C ${cfg.C}, context ${cfg.n_ctx}`;
+}
+
+function setTokenizer(text) {
+    const t = parseTokenizer(text);
+    vocab = t.vocab; specials = t.specials; firstSpecial = t.firstSpecial;
+    $("tag").innerHTML = specials.map((s, i) => `<option value="${i}">${s.replace(/[<>]/g, "")}</option>`).join("");
+}
+
+function ready() {
+    const ok = wasm && cfg && vocab;
+    if (ok && vocab.length !== cfg.V) {
+        $("status").textContent = `The tokenizer has ${vocab.length} ids but the model has ${cfg.V}. Pick matching files.`;
+        $("go").disabled = true;
+        return;
+    }
+    $("go").disabled = !ok || running;
+    if (ok) $("status").textContent = "Ready.";
+}
+
+// ---- seeded random numbers (mulberry32), so a seed reproduces a sample
+function rng(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+async function generate() {
+    running = true;
+    $("go").disabled = true;
+    $("stop").disabled = false;
+    const out = $("out");
+    out.textContent = "";
+    const tagId = firstSpecial + parseInt($("tag").value, 10);
+    const temp = parseFloat($("temp").value), topk = parseInt($("topk").value, 10) || 0;
+    const count = Math.max(1, parseInt($("count").value, 10) || 1);
+    const keep = $("keep").checked;
+    const rand = rng(parseInt($("seed").value, 10) || 0);
+    const tagSpan = document.createElement("span");
+    tagSpan.className = "tag";
+    tagSpan.textContent = specials[tagId - firstSpecial];
+    out.appendChild(tagSpan);
+    const textNode = document.createTextNode("\n");
+    out.appendChild(textNode);
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+
+    const history = [tagId, 10];               // the tag, then "\n", like reference/sample.py
+    let pos = 0, refills = 0, made = 0;
+    const feed = (token) => { wasm.step(token, pos); pos++; };
+    feed(history[0]);
+    feed(history[1]);
+    const t0 = performance.now();
+    while (running && made < count) {
+        const sliceEnd = performance.now() + 30;       // give the page a frame every 30 ms
+        while (running && made < count && performance.now() < sliceEnd) {
+            const next = wasm.sample(temp, topk, rand());
+            made++;
+            history.push(next);
+            if (next >= firstSpecial && !keep) {
+                textNode.appendData(`\n[the model started a new chunk: ${specials[next - firstSpecial]}]`);
+                running = false;
+                break;
+            }
+            textNode.appendData(decoder.decode(vocab[next], { stream: true }));
+            if (pos === cfg.n_ctx) {                     // full: the last half again at positions 0 .. n_ctx/2 - 1
+                const kept = history.slice(history.length - cfg.n_ctx / 2);
+                pos = 0;
+                kept.forEach(feed);
+                refills++;
+            } else {
+                feed(next);
+            }
+        }
+        $("ntok").textContent = made;
+        $("refills").textContent = refills;
+        $("speed").textContent = `${Math.round(made / ((performance.now() - t0) / 1000))} tok/s`;
+        await new Promise((r) => setTimeout(r, 0));
+    }
+    textNode.appendData(decoder.decode());
+    running = false;
+    $("stop").disabled = true;
+    ready();
+}
+
+$("temp").addEventListener("input", () => ($("tempv").textContent = $("temp").value));
+$("go").addEventListener("click", () => generate().catch((e) => ($("status").textContent = e.message)));
+$("stop").addEventListener("click", () => (running = false));
+$("wfile").addEventListener("change", async (e) => {
+    try {
+        const f = e.target.files[0];
+        const inst = await WebAssembly.instantiateStreaming(fetch("forward.wasm"));   // fresh memory for the new model
+        wasm = inst.instance.exports;
+        loadWeights(await f.arrayBuffer());
+        ready();
+    } catch (err) {
+        $("status").textContent = err.message;
+    }
+});
+$("tfile").addEventListener("change", async (e) => {
+    try {
+        setTokenizer(await e.target.files[0].text());
+        ready();
+    } catch (err) {
+        $("status").textContent = err.message;
+    }
+});
+
+(async () => {
+    try {
+        const [inst, wbytes, ttext] = await Promise.all([
+            WebAssembly.instantiateStreaming(fetch("forward.wasm")),
+            fetch("weights16.bin").then((r) => { if (!r.ok) throw new Error("no weights16.bin next to this page"); return r.arrayBuffer(); }),
+            fetch("tokenizer.bpe").then((r) => { if (!r.ok) throw new Error("no tokenizer.bpe next to this page"); return r.text(); }),
+        ]);
+        wasm = inst.instance.exports;
+        loadWeights(wbytes);
+        setTokenizer(ttext);
+        ready();
+    } catch (err) {
+        $("status").textContent = err.message + ". Pick the files below, or see the README for how to make them.";
+    }
+})();
+</script>
+</body>
+</html>

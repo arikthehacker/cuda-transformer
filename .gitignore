@@ -12,6 +12,13 @@ build/
 *.bin
 *.ckpt
 
+# Browser demo files made by make demo (only a public model belongs online)
+demo/forward.wasm
+demo/tokenizer.bpe
+
+# Benchmark logs (the results_*.md tables and curves.svg are kept)
+bench/logs/
+
 # Profiler reports
 *.nsys-rep
 *.ncu-rep
