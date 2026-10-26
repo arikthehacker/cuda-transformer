@@ -15,10 +15,9 @@ DATA = ROOT / "data"
 WORK = DATA / "playground"
 TOKENIZER = DATA / "tokenizer.bpe"
 CHECKPOINTS = [DATA / "ref" / "best.pt", DATA / "ref" / "play" / "best.pt"]
-ON_WINDOWS = os.name == "nt"
-CUDA_PATH = "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
 
 sys.path.insert(0, str(ROOT))
+from pipeline import CUDA_PATH, ON_WINDOWS, linux_command
 from reference.tokenizer import load_bpe
 
 
@@ -114,12 +113,6 @@ def menu(name: str, options: list[tuple[str, str]]) -> str:
         if choice in keys:
             return choice
         problem(f"  pick one of {', '.join(keys)}")
-
-
-def linux_command(cmd: list[str]) -> list[str]:
-    if ON_WINDOWS:
-        return ["wsl", "--cd", str(ROOT), "--", "env", f"PATH={CUDA_PATH}"] + cmd
-    return cmd
 
 
 def run_linux(cmd: list[str], keep=None) -> tuple[int, list[str]]:
