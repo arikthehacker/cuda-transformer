@@ -332,9 +332,7 @@ __global__ void __launch_bounds__(THREADS) flash_bwd_kernel(__half *dqkv, float 
     load_rows<D>(sV, base + static_cast<long long>(kvt) * TILE * ld + 2 * C + h * D, ld);
     __syncthreads();
     uint32_t ak[D / 16][4];
-    uint32_t av[D / 16][4];
     load_a_rows<D>(ak, sK, warp * 16, lane);
-    load_a_rows<D>(av, sV, warp * 16, lane);
 
     float dk[D / 8][4];
     float dv[D / 8][4];
@@ -377,7 +375,11 @@ __global__ void __launch_bounds__(THREADS) flash_bwd_kernel(__half *dqkv, float 
 
         float ds[8][4];                     // dP^T = V dO^T, then dS^T = P^T (dP^T - D)
         zero(ds);
-        mma_abt<D>(ds, av, sdO, lane);
+        {
+            uint32_t av[D / 16][4];         // reloaded from sV each tile: holding it live spills at D = 64
+            load_a_rows<D>(av, sV, warp * 16, lane);
+            mma_abt<D>(ds, av, sdO, lane);
+        }
         #pragma unroll
         for (int nt = 0; nt < 8; nt++)
         {
