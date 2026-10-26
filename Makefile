@@ -33,3 +33,50 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all run test clean
+
+
+# ==================================================================== stage 3: CUDA
+
+NVCC     = nvcc
+NVFLAGS  = -O3 -std=c++17 -arch=sm_75 -lineinfo -Xcompiler -Wall
+# NEVER add --use_fast_math in stage 3: it swaps expf, tanhf and division for
+# faster, less accurate versions and the dump will stop matching.
+ifeq ($(DEBUG),1)
+  NVFLAGS = -std=c++17 -arch=sm_75 -g -G -DCUDA_DEBUG -Xcompiler -Wall
+endif
+CU_SRC   = cuda/common.cu cuda/dump.cu cuda/gpt.cu $(wildcard cuda/kernels/*.cu)
+CU_HDR   = $(wildcard cuda/*.h cuda/kernels/*.h cuda/kernels/*.cuh)
+DUMP     = data/ref/debug.bin
+DUMP_FULL = $(wildcard data/ref/debug_full.bin)
+
+cuda: $(BUILD)/test_kernels $(BUILD)/test_gpt $(BUILD)/train_gpt
+
+$(BUILD)/hello: cuda/tests/hello.cu cuda/common.h | $(BUILD)
+	$(NVCC) $(NVFLAGS) -Icuda -o $@ cuda/tests/hello.cu
+
+$(BUILD)/test_kernels: cuda/tests/test_kernels.cu $(CU_SRC) $(CU_HDR) | $(BUILD)
+	$(NVCC) $(NVFLAGS) -Icuda -o $@ cuda/tests/test_kernels.cu $(CU_SRC)
+
+$(BUILD)/test_gpt: cuda/tests/test_gpt.cu $(CU_SRC) $(CU_HDR) | $(BUILD)
+	$(NVCC) $(NVFLAGS) -Icuda -o $@ cuda/tests/test_gpt.cu $(CU_SRC)
+
+$(BUILD)/train_gpt: cuda/train.cu $(CU_SRC) $(CU_HDR) | $(BUILD)
+	$(NVCC) $(NVFLAGS) -Icuda -o $@ cuda/train.cu $(CU_SRC)
+
+# step 1 of the setup: a one line kernel, copied back and printed
+cuda-hello: $(BUILD)/hello
+	./$(BUILD)/hello
+
+test-cuda: $(BUILD)/test_kernels $(BUILD)/test_gpt
+	./$(BUILD)/test_kernels $(DUMP)
+	./$(BUILD)/test_gpt $(DUMP) $(DUMP_FULL)
+
+# catches out of bounds reads/writes and race conditions on the GPU
+sanitize-cuda: $(BUILD)/test_kernels
+	compute-sanitizer --tool memcheck ./$(BUILD)/test_kernels $(DUMP)
+	compute-sanitizer --tool racecheck ./$(BUILD)/test_kernels $(DUMP)
+
+train-cuda: $(BUILD)/train_gpt
+	./$(BUILD)/train_gpt
+
+.PHONY: cuda cuda-hello test-cuda sanitize-cuda train-cuda
