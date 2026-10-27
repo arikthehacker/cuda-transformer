@@ -30,6 +30,7 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 
 import numpy as np
 
@@ -77,30 +78,64 @@ def make_scaler(enabled: bool):
 
 def lr_at(step: int, tc: TrainConfig) -> float:
     """Learning rate for 0-based `step`: linear warmup to lr over warmup_steps,
-    then cosine down to min_lr at max_steps."""
+    then cosine down to min_lr at max_steps. With decay_steps > 0 (WSD) it stays
+    at lr until the last decay_steps, then falls as min_lr + (lr - min_lr) *
+    (1 - sqrt(p)), the shape Hagele et al. 2024 found best. Same numbers as
+    cuda/gpt.cu lr_at() and the GPU's lr_schedule()."""
     if step < tc.warmup_steps:
         return tc.lr * (step + 1) / tc.warmup_steps
     if step >= tc.max_steps:
         return tc.min_lr
+    if tc.decay_steps > 0:
+        decay_from = tc.max_steps - tc.decay_steps
+        if step < decay_from:
+            return tc.lr
+        p = (step - decay_from) / tc.decay_steps
+        return tc.min_lr + (tc.lr - tc.min_lr) * (1.0 - math.sqrt(p))
     progress = (step - tc.warmup_steps) / max(1, tc.max_steps - tc.warmup_steps)   # 0 -> 1
     return tc.min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (tc.lr - tc.min_lr)
 
 
+def token_byte_lengths(vocab: list[bytes], tags: dict[str, int], padded_vocab: int) -> list[int]:
+    """Bytes of text each id stands for: len(vocab[id]) for real tokens, 0 for
+    tags and padded ids (they are not text, so bits per byte leaves them out)."""
+    out = [len(v) for v in vocab] + [0] * (padded_vocab - len(vocab))
+    for i in tags.values():
+        out[i] = 0
+    return out
+
+
 @torch.no_grad()
-def evaluate(model: GPT, batches: list[tuple[torch.Tensor, torch.Tensor]], masked: bool = False) -> float:
-    """Mean loss over the fixed val batches. masked (SFT): each batch's mean
+def evaluate(model: GPT, batches: list[tuple[torch.Tensor, torch.Tensor]], masked: bool = False,
+             token_bytes: torch.Tensor | None = None) -> tuple[float, float]:
+    """(val loss, val bits per byte) over the fixed val batches.
+
+    The loss is the mean of the batch means; masked (SFT): each batch's mean
     weighted by its counted targets, so the result is the mean over every
-    counted target, the same number cuda/train_fast --sft prints."""
-    if not masked:
-        losses = [model(x, y)[1].float() for x, y in batches]
-        return torch.stack(losses).mean().item()
-    total, count = 0.0, 0
+    counted target, the same number cuda/train_fast --sft prints.
+
+    Bits per byte = (loss in nats summed over the counted targets that are
+    text, not tags) / (ln 2 x the bytes of those target tokens). Unlike the
+    loss per token it does not depend on the tokenizer. nan without token_bytes."""
+    V = model.cfg.vocab_size
+    batch_means, total, count = [], 0.0, 0
+    nats, nbytes = 0.0, 0
     for x, y in batches:
+        logits, loss = model(x, y)
         n = int((y >= 0).sum())
+        batch_means.append(loss.float())
         if n:
-            total += model(x, y)[1].float().item() * n
+            total += loss.float().item() * n
             count += n
-    return total / max(1, count)
+        if token_bytes is not None:
+            each = F.cross_entropy(logits[..., :V].float().reshape(-1, V), y.reshape(-1), ignore_index=-1,
+                                   reduction="none")                                     # (B*T,), 0 where y = -1
+            b = token_bytes[y.reshape(-1).clamp(min=0)] * (y.reshape(-1) >= 0)         # (B*T,) bytes, 0 for tags
+            nats += each[b > 0].double().sum().item()
+            nbytes += int(b.sum())
+    val = total / max(1, count) if masked else torch.stack(batch_means).mean().item()
+    bpb = nats / (math.log(2) * nbytes) if nbytes else float("nan")
+    return val, bpb
 
 
 def train_step(model: GPT, opt: torch.optim.Optimizer, scaler, x: torch.Tensor, y: torch.Tensor,
@@ -238,6 +273,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-lr", type=float,
                    help=f"learning rate at the end (default {_e(tc.min_lr)}, --sft {_e(SFT_TRAIN['min_lr'])})")
     p.add_argument("--warmup", type=int, help=f"warmup steps (default {tc.warmup_steps}; 2000 for the chat pretrain)")
+    p.add_argument("--decay-steps", type=int,
+                   help="WSD: flat at lr, then 1 - sqrt down to min_lr over the last N steps (default 0: cosine)")
+    p.add_argument("--beta2", type=float, help=f"AdamW beta2 (default {tc.beta2:g})")
     return p.parse_args(argv)
 
 
@@ -288,6 +326,12 @@ def main(argv: list[str] | None = None) -> None:
         tc = dataclasses.replace(tc, min_lr=args.min_lr)
     if args.warmup is not None:
         tc = dataclasses.replace(tc, warmup_steps=args.warmup)
+    if args.decay_steps is not None:
+        tc = dataclasses.replace(tc, decay_steps=args.decay_steps)
+    if args.beta2 is not None:
+        tc = dataclasses.replace(tc, beta2=args.beta2)
+    if not 0 <= tc.decay_steps <= tc.max_steps:
+        raise SystemExit(f"--decay-steps {tc.decay_steps} must be from 0 to the {tc.max_steps} steps")
     train_path, val_path, tok_path = data_paths(args)
     run = {"data": args.data, "tokenizer": tok_path, "sft": args.sft}
 
@@ -376,8 +420,9 @@ def main(argv: list[str] | None = None) -> None:
           f"{tokens_per_step:,} tokens per step")
     print(f"mode   {mode} on {device}" + (f", resuming at step {start_step}" if ckpt else "")
           + (f", from {args.init}" if init is not None else "") + (", sft (answers only)" if args.sft else ""))
-    val = evaluate(model, val_batches, args.sft)
-    print(f"step {start_step:4d} | val {val:.3f} | ln(V) = {math.log(cfg.vocab_size):.3f}")
+    token_bytes = torch.tensor(token_byte_lengths(vocab, tags, cfg.padded_vocab), dtype=torch.int64, device=device)
+    val, bpb = evaluate(model, val_batches, args.sft, token_bytes)
+    print(f"step {start_step:4d} | val {val:.3f} | bpb {bpb:.4f} | ln(V) = {math.log(cfg.vocab_size):.3f}")
 
     cuda = device.type == "cuda"
     peak = tc.peak_tflops_fp16 if args.fast else tc.peak_tflops_fp32    # MFU against the peak of the math in use
@@ -401,8 +446,8 @@ def main(argv: list[str] | None = None) -> None:
     log_file = open(log_path, "a" if ckpt else "w", newline="", encoding="utf-8")
     log = csv.writer(log_file)
     if not ckpt:
-        log.writerow(["step", "train", "val", "lr", "norm", "ms"])
-        log.writerow([0, "", f"{val:.6f}", "", "", ""])
+        log.writerow(["step", "train", "val", "lr", "norm", "ms", "val_bpb"])
+        log.writerow([0, "", f"{val:.6f}", "", "", "", f"{bpb:.6f}"])
 
     rows = []                       # finished steps not yet in log.csv: (step, loss, norm, lr, start, end)
     starts_file = open(args.starts, "a" if ckpt else "w", encoding="utf-8") if args.starts else None
@@ -441,12 +486,12 @@ def main(argv: list[str] | None = None) -> None:
                 timed_steps += window_steps
                 timed_secs += secs
 
-            val = evaluate(model, val_batches, args.sft)
+            val, bpb = evaluate(model, val_batches, args.sft, token_bytes)
             losses = [r[1].item() for r in rows]
             for i, (s, l, n, r_lr, a, b) in enumerate(rows):
                 last = i == len(rows) - 1
                 log.writerow([s, f"{losses[i]:.6f}", f"{val:.6f}" if last else "", f"{r_lr:.6e}",
-                              f"{n.item():.4f}", f"{step_ms(a, b):.2f}"])
+                              f"{n.item():.4f}", f"{step_ms(a, b):.2f}", f"{bpb:.6f}" if last else ""])
             log_file.flush()
             if starts_file:
                 for s in pending_starts:
@@ -458,7 +503,7 @@ def main(argv: list[str] | None = None) -> None:
 
             speed = "warming up" if math.isnan(tok_s) else \
                 f"{tok_s:,.0f} tok/s | mfu {100 * mfu(n_params, tok_s, peak):.1f}%"
-            print(f"step {step:4d} | train {sum(losses) / len(losses):.3f} | val {val:.3f} | "
+            print(f"step {step:4d} | train {sum(losses) / len(losses):.3f} | val {val:.3f} | bpb {bpb:.4f} | "
                   f"lr {lr:.1e} | norm {last_norm:.2f} | {speed}")
 
             if val < best_val:

@@ -12,6 +12,7 @@ import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")    # before CUDA starts
 
 import copy
+import dataclasses
 import math
 
 import numpy as np
@@ -325,3 +326,45 @@ def test_export_init_matches_a_fresh_train_run(tmp_path):
     assert cfg.same_size(model.cfg)
     for name, p in model.named_parameters():
         assert np.array_equal(params[name], p.detach().numpy()), name
+
+
+# ------------------------------------------------------------------ before the run: WSD and bits per byte
+
+def test_lr_wsd():
+    from .train import lr_at
+
+    cosine = TrainConfig(max_steps=300, warmup_steps=20)
+    same = dataclasses.replace(cosine, decay_steps=0)
+    assert all(lr_at(s, cosine) == lr_at(s, same) for s in range(320))       # decay 0: the old cosine
+    wsd = dataclasses.replace(cosine, decay_steps=60)
+    assert lr_at(19, wsd) == pytest.approx(wsd.lr)
+    assert all(lr_at(s, wsd) == wsd.lr for s in range(20, 240))               # flat until the decay
+    assert lr_at(240, wsd) == wsd.lr                                          # p = 0
+    falling = [lr_at(s, wsd) for s in range(240, 300)]
+    assert all(a > b for a, b in zip(falling, falling[1:]))
+    assert lr_at(270, wsd) == pytest.approx(wsd.min_lr + (wsd.lr - wsd.min_lr) * (1 - math.sqrt(0.5)))
+    assert lr_at(300, wsd) == wsd.min_lr
+
+
+def test_bits_per_byte():
+    from .train import evaluate, token_byte_lengths
+
+    cfg = tiny_model_config(vocab_size())
+    model = fresh(cfg)
+    x, y = one_batch(cfg, 4)
+    # every id one byte and no tags: bpb x ln 2 is the mean loss
+    ones = torch.ones(cfg.padded_vocab, dtype=torch.int64, device=DEVICE)
+    val, bpb = evaluate(model, [(x, y)], False, ones)
+    assert bpb * math.log(2) == pytest.approx(val, rel=1e-5)
+    # tags count no bytes, so their targets drop out of both sums
+    vocab, tags = load_bpe(TOKENIZER_PATH) if os.path.exists(TOKENIZER_PATH) else ([b"x"] * cfg.vocab_size, {})
+    lengths = token_byte_lengths(vocab, tags, cfg.padded_vocab)
+    assert len(lengths) == cfg.padded_vocab and all(lengths[i] == 0 for i in tags.values())
+    assert all(v == 0 for v in lengths[cfg.vocab_size:])
+    tb = torch.tensor(lengths, dtype=torch.int64, device=DEVICE)
+    logits, _ = model(x, y)
+    each = F.cross_entropy(logits[..., :cfg.vocab_size].float().reshape(-1, cfg.vocab_size), y.reshape(-1),
+                           reduction="none")
+    b = tb[y.reshape(-1)]
+    want = each[b > 0].double().sum().item() / (math.log(2) * int(b.sum()))
+    assert evaluate(model, [(x, y)], False, tb)[1] == pytest.approx(want, rel=1e-6)

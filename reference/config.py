@@ -71,6 +71,7 @@ class TrainConfig:
     lr: float = 6e-4
     min_lr: float = 6e-5
     warmup_steps: int = 200
+    decay_steps: int = 0       # 0: cosine to min_lr; > 0: WSD, flat at lr, then 1 - sqrt to min_lr over the last decay_steps
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
