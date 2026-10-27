@@ -29,10 +29,13 @@ run: $(BUILD)/bpe
 test: $(BUILD)/test_bpe
 	./$(BUILD)/test_bpe
 
+# the tokenizer's checks, the pretokenizer v2 ones included
+test-tok: test
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all run test clean
+.PHONY: all run test test-tok clean
 
 
 # ==================================================================== stage 3: CUDA
@@ -266,12 +269,22 @@ serve-demo: demo
 # Only these public sources go into this model: no my_writing/ here.
 CHAT       = data/chat
 CHAT_TOK   = $(CHAT)/tokenizer.bpe
+# the tag ids, in order: the three the data has, then four reserved for later stages
+CHAT_TAGS  = <web>,<user>,<assistant>,<system>,<tool>,<code>,<book>
 MASKED     = data/ref/debug_chat_masked.bin
-# B 16 x T 512 = 8,192 tokens a step: 30,000 steps is 246M tokens, the full
-# 1B token set is about 122,000. SFT: 6,000 steps draws 96k of the 413k
-# conversations whose answer fits in 512 tokens; one draw each is about 26,000.
-CHAT_STEPS ?= 30000
+# B 16 x T 512 = 8,192 tokens a step: 122,000 steps is the 1B token set.
+# SFT: 6,000 steps draws 96k of the 413k conversations whose answer fits in
+# 512 tokens; one draw each is about 26,000.
+CHAT_STEPS ?= 122000
 SFT_STEPS  ?= 6000
+# the pretraining schedule: WSD with the last 20% decaying (DECAY_STEPS=0 is the
+# old cosine), lr and beta2 from make sweep, KEEP lists steps whose checkpoints
+# stay as ckpt_<step>.bin for branches (make chat-branch)
+LR          ?= 6e-4
+MIN_LR      ?= 6e-5
+BETA2       ?= 0.95
+DECAY_STEPS ?= 24400
+KEEP        ?=
 # make chat-pretrain RESUME=1 (or chat-sft) picks a stopped run up from its last checkpoint
 RESUME_FLAG = $(if $(RESUME),-r)
 # where the pretraining run lives: a 100M token test run can go elsewhere,
@@ -283,9 +296,9 @@ chat-data:
 
 # the tokenizer, then every text file as BPE1 tokens, the SFT targets, and PyTorch's starting weights
 chat-tokens: $(BUILD)/bpe
-	head -c 300000000 $(CHAT)/pretrain_000.txt | sed '$$d' > $(CHAT)/tok_sample.txt
-	head -c 300000000 $(CHAT)/sft_train.txt | sed '$$d' >> $(CHAT)/tok_sample.txt
-	./$(BUILD)/bpe -t -i $(CHAT)/tok_sample.txt -n 16384 -o $(CHAT_TOK) -v
+	cat $(CHAT)/pretrain_[0-9][0-9][0-9].txt | head -c 420000000 | sed '$$d' > $(CHAT)/tok_sample.txt
+	head -c 180000000 $(CHAT)/sft_train.txt | sed '$$d' >> $(CHAT)/tok_sample.txt
+	./$(BUILD)/bpe -t -i $(CHAT)/tok_sample.txt -n 16384 -r "$(CHAT_TAGS)" -o $(CHAT_TOK) -v
 	python.exe -m reference.chat --check-tokenizer $(CHAT_TOK)
 	for f in $(CHAT)/pretrain_[0-9][0-9][0-9].txt; do \
 		./$(BUILD)/bpe -e -m $(CHAT_TOK) -i $$f -o $${f%.txt}.bin || exit 1; \
@@ -297,11 +310,27 @@ chat-tokens: $(BUILD)/bpe
 	python.exe -m reference.chat --tokens $(CHAT)/sft_train.bin --tokenizer $(CHAT_TOK) --n-ctx 512
 	python.exe -m reference.chat --tokens $(CHAT)/sft_val.bin --tokenizer $(CHAT_TOK) --n-ctx 512
 	python.exe -m reference.export --init --config chat --vocab-from $(CHAT_TOK) --out $(CHAT)/init.bin
+	rm -f $(MASKED)
 
 # a checkpoint (about 400 MB) after every eval; -e 1000 keeps the writes to one every couple of minutes
 chat-pretrain: $(BUILD)/train_fast
 	./$(BUILD)/train_fast -w $(CHAT)/init.bin -D $(CHAT)/pretrain --warmup 2000 -n $(CHAT_STEPS) -e 1000 \
+		--lr $(LR) --min-lr $(MIN_LR) --beta2 $(BETA2) --decay-steps $(DECAY_STEPS) $(if $(KEEP),--keep $(KEEP)) \
 		-c $(PRE_DIR) $(RESUME_FLAG)
+
+# a shorter model from a kept checkpoint of a long WSD run: its weights and AdamW state,
+# its own length and decay, e.g.
+#   make chat-branch FROM=data/chat/trunk/ckpt_97600.bin N=122000 DECAY=24400 OUT=data/chat/b1
+# and make chat-branch OUT=data/chat/b1 RESUME=1 picks a stopped branch up like any run
+chat-branch: $(BUILD)/train_fast
+	$(if $(RESUME),./$(BUILD)/train_fast -c $(OUT) -r,./$(BUILD)/train_fast --branch $(FROM) -D $(CHAT)/pretrain \
+		-n $(N) --decay-steps $(DECAY) -c $(OUT))
+
+# 7 runs of 100M tokens on the same batches: lr {6e-4, 1.2e-3, 2e-3} x beta2 {0.95, 0.99}, and the
+# baseline twice (the A/A run gives the noise floor) -> bench/results_sweep.md
+sweep: $(BUILD)/train_fast
+	bash bench/sweep_lr.sh
+	python3 bench/sweep_summary.py
 
 # lr 1e-4, warmup 100, a fresh AdamW (the pretrain's moments stay in its own checkpoint)
 chat-sft: $(BUILD)/train_fast
@@ -343,4 +372,5 @@ demo-chat: demo/forward.wasm
 chat-results:
 	python3 bench/chat_results.py
 
-.PHONY: chat-data chat-tokens chat-pretrain chat-sft chat-compare chat test-chat demo-chat chat-results
+.PHONY: chat-data chat-tokens chat-pretrain chat-branch sweep chat-sft chat-compare chat test-chat demo-chat \
+        chat-results

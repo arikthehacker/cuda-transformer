@@ -23,6 +23,7 @@ def read_log(path: str) -> list[dict]:
 def summary(rows: list[dict], tokens_per_step: int, skip: int) -> dict:
     steps = [r for r in rows if r["train"]]
     vals = [(int(r["step"]), float(r["val"])) for r in rows if r["val"]]
+    bpbs = [float(r["val_bpb"]) for r in rows if r.get("val_bpb") not in (None, "", "nan")]
     timed = steps[skip:] if len(steps) > skip else steps
     ms = sum(float(r["ms"]) for r in timed)
     counted = [int(r["counted"]) for r in steps if r.get("counted")]
@@ -34,6 +35,7 @@ def summary(rows: list[dict], tokens_per_step: int, skip: int) -> dict:
         "best_val": best,
         "best_step": best_step,
         "final_val": vals[-1][1],
+        "final_bpb": bpbs[-1] if bpbs else float("nan"),
         "tok_s": len(timed) * tokens_per_step / (ms / 1000.0) if ms > 0 else float("nan"),
         "hours": sum(float(r["ms"]) for r in steps) / 3.6e6,
         "counted": sum(counted) / len(counted) if counted else 0.0,
@@ -47,18 +49,21 @@ def main() -> None:
     p.add_argument("--skip", type=int, default=10, help="first steps left out of tok/s (default 10)")
     p.add_argument("--out", default="bench/results_chat.md")
     args = p.parse_args()
-    lines = ["| run | steps | tokens | val at start | best val | final val | tok/s | GPU hours | counted per step |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| run | steps | tokens | val at start | best val | final val | final val bpb | tok/s | GPU hours | "
+             "counted per step |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for name, path in RUNS:
         if not os.path.exists(path):
-            lines.append(f"| {name} | not run yet (`{path}`) | | | | | | | |")
+            lines.append(f"| {name} | not run yet (`{path}`) | | | | | | | | |")
             continue
         s = summary(read_log(path), args.tokens_per_step, args.skip)
         lines.append(f"| {name} | {s['steps']:,} | {s['tokens'] / 1e6:,.0f}M | {s['first_val']:.3f} | "
-                     f"{s['best_val']:.3f} (step {s['best_step']:,}) | {s['final_val']:.3f} | {s['tok_s']:,.0f} | "
+                     f"{s['best_val']:.3f} (step {s['best_step']:,}) | {s['final_val']:.3f} | {s['final_bpb']:.4f} | "
+                     f"{s['tok_s']:,.0f} | "
                      f"{s['hours']:.2f} | {s['counted']:,.0f} of {args.tokens_per_step:,} |")
     lines += ["", "The SFT val loss counts only the answer tokens of smol-smoltalk's test split, so it is not on the "
-              "same scale as the pretraining val loss."]
+              "same scale as the pretraining val loss. Bits per byte leave the tags out and do not depend on the "
+              "tokenizer."]
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))

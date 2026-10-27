@@ -8,6 +8,7 @@ It only copies what the benchmarks wrote (nothing here makes up a number):
     bench/results_gemm.md       ./build/bench_gemm
     bench/results_curves.md     python3 bench/curves.py      (and bench/curves.svg)
     bench/results_generate.md   ./build/generate -b -o bench/results_generate.md
+    bench/results_sweep.md      make sweep
     bench/results_chat.md       python3 bench/chat_results.py   (after make chat-pretrain and chat-sft)
 A missing file shows up as "not measured yet" in its subsection.
 """
@@ -29,6 +30,8 @@ PARTS = [
      "PyTorch fast mode and train_fast on the same batches (reference/train.py --starts, train_fast -s)."),
     ("generation", "bench/results_generate.md",
      "Tokens per second for one sample, prompt and every cache rollover included."),
+    ("learning rate sweep", "bench/results_sweep.md",
+     "lr x beta2 at the chat size, 100M tokens each, the same batches (bench/sweep_lr.sh, bench/sweep_summary.py)."),
     ("chat model", "bench/results_chat.md",
      "L 8, H 8, C 512, n_ctx 512, 33.9M parameters, batch 16 x 512 tokens. Pretrained on FineWeb-Edu, then "
      "fine-tuned on smol-smoltalk (bench/chat_results.py reads both train_fast logs)."),
