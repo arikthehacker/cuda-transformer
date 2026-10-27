@@ -34,6 +34,9 @@ FINEWEB_DIR = "sample/10BT/"
 SMOLTALK = "HuggingFaceTB/smol-smoltalk"
 OUT = "data/chat"
 RAW = os.path.join(OUT, "raw")
+# Hugging Face's own cache (the xet chunk cache can reach 10 GB) stays with the
+# data instead of the home folder, unless HF_HOME is already set
+os.environ.setdefault("HF_HOME", os.path.join(OUT, "hf"))
 HOLD_OUT_EVERY = 100            # document k goes to val when k % 100 == 99
 
 # The tokenizer makes a special token out of any line that is exactly "<" + [a-z_]+ ">"
