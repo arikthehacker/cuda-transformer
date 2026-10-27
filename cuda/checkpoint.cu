@@ -19,7 +19,7 @@
 using namespace std;
 
 static const char MAGIC[4] = {'G', 'P', 'T', 'C'};
-static const uint32_t VERSION = 1;
+static const uint32_t VERSION = 2;
 
 bool same_size(const ModelConfig &a, const ModelConfig &b)
 {
@@ -103,6 +103,10 @@ void write_checkpoint(const string &path, const Checkpoint &c)
     w.bytes(&c.state, sizeof(StepState));
     w.str(r.data);
     w.str(r.starts);
+    w.i32(r.decay_steps);
+    w.f32(r.beta2);
+    w.str(r.keep);
+    w.str(r.branch);
     w.u64(n);
     w.bytes(c.params.data(), n * sizeof(float));
     w.bytes(c.m.data(), n * sizeof(float));
@@ -213,9 +217,9 @@ bool try_read_checkpoint(const string &path, Checkpoint &c, string &why)
         return false;
     }
     uint32_t version = r.u32();
-    if (version != VERSION)
+    if (version != 1 && version != VERSION)
     {
-        why = "version " + to_string(version) + ", this program reads version " + to_string(VERSION);
+        why = "version " + to_string(version) + ", this program reads versions 1 and 2";
         return false;
     }
     ModelConfig &m = c.cfg;
@@ -246,6 +250,13 @@ bool try_read_checkpoint(const string &path, Checkpoint &c, string &why)
     r.bytes(&c.state, sizeof(StepState));
     run.data = r.str();
     run.starts = r.str();
+    if (version >= 2)
+    {
+        run.decay_steps = r.i32();
+        run.beta2 = r.f32();
+        run.keep = r.str();
+        run.branch = r.str();
+    }
     uint64_t n = r.u64();
     if (!r.ok || (buf.size() - r.at) != 3 * n * sizeof(float))
     {

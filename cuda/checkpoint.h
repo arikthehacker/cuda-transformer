@@ -3,14 +3,19 @@
 // stopped (cuda/train_fast -c dir writes one every eval, -r resumes).
 //
 //   little endian, then the arrays:
-//   char[4]  "GPTC", uint32 version 1
+//   char[4]  "GPTC", uint32 version 2
 //   uint32   V, Vp, n_ctx, L, H, C, then float32 ln_eps          the model size
 //   uint32   B, max_steps, eval_every, warmup_steps, sft         the run, so a
 //   float32  lr, min_lr                                          resume is the same run
 //   float32  best_val, int32 best_step
 //   uint32   sizeof(StepState), then the StepState              loss scale, step, AdamW t ...
 //   uint32   length + bytes of the data prefix (-D), then of the starts file (-s)
+//   version 2 only:
+//   int32    decay_steps (0 = cosine), float32 beta2
+//   uint32   length + bytes of the --keep list, then of the --branch source
 //   uint64   n, then float32 params[n], m[n], v[n]               weights and AdamW moments
+//
+// A version 1 file still reads, as decay_steps 0, beta2 0.95, no keep list, no branch.
 //
 // The write goes to path.tmp, is flushed to disk (fsync), and only then
 // renamed over path, so a crash or a power cut never leaves half a file
@@ -31,6 +36,10 @@ struct RunInfo                  // what a resumed run must share with the one th
     float lr = 0.0f, min_lr = 0.0f;
     std::string data;           // -D prefix, "" = data/train.bin and data/val.bin
     std::string starts;         // -s file, "" = the run's own random batches
+    int decay_steps = 0;        // WSD decay length, 0 = cosine
+    float beta2 = 0.95f;
+    std::string keep;           // --keep steps, "97600,195200"
+    std::string branch;         // the checkpoint this run branched from, "" = none
     float best_val = 0.0f;
     int best_step = 0;
 };

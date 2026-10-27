@@ -141,10 +141,10 @@ $(BUILD)/test_checkpoint: $(BUILD)/o16/cuda/tests/test_checkpoint.o $(OBJ16)
 $(BUILD)/test_checkpoint32: $(BUILD)/o32/cuda/tests/test_checkpoint.o $(OBJ32)
 	$(NVCC) $(NVFLAGS) -o $@ $^
 
-$(BUILD)/train_fast: $(BUILD)/o16/cuda/train_fast.o $(OBJ16)
+$(BUILD)/train_fast: $(BUILD)/o16/cuda/train_fast.o $(OBJ16) $(BUILD)/o16/tokenizer/bpe.o
 	$(NVCC) $(NVFLAGS16) -o $@ $^
 
-$(BUILD)/train_fast32: $(BUILD)/o32/cuda/train_fast.o $(OBJ32)
+$(BUILD)/train_fast32: $(BUILD)/o32/cuda/train_fast.o $(OBJ32) $(BUILD)/o32/tokenizer/bpe.o
 	$(NVCC) $(NVFLAGS) -o $@ $^
 
 $(BUILD)/bench_gemm: $(BUILD)/o16/bench/bench_gemm.o $(OBJ16)

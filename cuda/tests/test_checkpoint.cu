@@ -9,6 +9,11 @@
 //    model restored from it, then 10 more steps. Same batches (load_batch
 //    from the uploaded starts, SFT targets with -1 in them), same graph.
 //    The losses of steps 11 to 20 must be identical.
+// 3. the WSD schedule: the GPU's lr equals lr_at() on the host at every step
+//    that matters, cosine and WSD
+// 4. a branch: from the step 10 checkpoint of a WSD run, a run with its own
+//    longer -n and decay gets the trunk's losses at steps 11 to 20 (both still
+//    in the flat part), then decays on its own schedule
 //
 // On a GPU the gradient sums that use atomics (split-K GEMMs, the wte
 // scatter, the flash attention dq) add in a different order on every run, so
@@ -89,6 +94,10 @@ static void file_checks(const ModelConfig &cfg)
     c.run.starts = "a file with spaces.txt";
     c.run.best_val = 2.718f;
     c.run.best_step = 4750;
+    c.run.decay_steps = 73200;
+    c.run.beta2 = 0.99f;
+    c.run.keep = "97600,195200";
+    c.run.branch = "data/chat/trunk/ckpt_97600.bin";
     c.state = initial_state(32768.0f);
     c.state.step = 4750;
     c.state.adam_t = 4741;
@@ -120,6 +129,9 @@ static void file_checks(const ModelConfig &cfg)
                 b.run.data == c.run.data && b.run.starts == c.run.starts && b.run.best_val == c.run.best_val &&
                 b.run.best_step == c.run.best_step;
     check(same, "sizes and run settings read back the same");
+    check(b.run.decay_steps == c.run.decay_steps && b.run.beta2 == c.run.beta2 && b.run.keep == c.run.keep &&
+              b.run.branch == c.run.branch,
+          "version 2: decay steps, beta2, the keep list and the branch source too");
     check(same_state(b.state, c.state), "the StepState reads back byte for byte");
     bool arrays = memcmp(b.params.data(), c.params.data(), c.params.size() * sizeof(float)) == 0 &&
                   memcmp(b.m.data(), c.m.data(), c.m.size() * sizeof(float)) == 0 &&
@@ -133,6 +145,23 @@ static void file_checks(const ModelConfig &cfg)
     vector<unsigned char> raw = file_bytes(path);
     string why;
     Checkpoint bad;
+
+    // a version 1 file (no decay, beta2, keep or branch) still reads, with the old defaults
+    {
+        size_t arrays_at = raw.size() - 3 * c.params.size() * sizeof(float) - 8;
+        size_t v2_bytes = 4 + 4 + 4 + c.run.keep.size() + 4 + c.run.branch.size();
+        vector<unsigned char> v1(raw.begin(), raw.begin() + (arrays_at - v2_bytes));
+        v1.insert(v1.end(), raw.begin() + arrays_at, raw.end());
+        v1[4] = 1;                          // the version, little endian
+        ofstream out(path2, ios::binary);
+        out.write(reinterpret_cast<const char *>(v1.data()), static_cast<streamsize>(v1.size()));
+    }
+    Checkpoint old;
+    bool read_v1 = try_read_checkpoint(path2, old, why);
+    check(read_v1 && old.run.decay_steps == 0 && old.run.beta2 == 0.95f && old.run.keep.empty() &&
+              old.run.branch.empty() && old.run.starts == c.run.starts && old.params == c.params && old.v == c.v,
+          "a version 1 checkpoint reads as cosine, beta2 0.95, no keep list" + (read_v1 ? string() : " (" + why + ")"));
+
     {
         ofstream out(path2, ios::binary);
         out.write(reinterpret_cast<const char *>(raw.data()), static_cast<streamsize>(raw.size() - 5));
@@ -321,6 +350,92 @@ static void resume_checks(const Dump &d, const ModelConfig &cfg)
     check(end.lr == straight_end[0].lr, "the last step used the same learning rate");
 }
 
+// ---------------------------------------------------------------- the schedule and branches
+
+static void schedule_checks()
+{
+    printf("\nthe lr schedule: GPU against lr_at() on the host\n");
+    int worst_step = -1;
+    double worst = 0.0;
+    for (int decay : {0, 30})
+    {
+        TrainConfig tc;
+        tc.lr = 1e-3f;
+        tc.min_lr = 1e-4f;
+        tc.warmup_steps = 10;
+        tc.max_steps = 100;
+        tc.decay_steps = decay;
+        ScheduleConfig sc = {tc.lr, tc.min_lr, tc.warmup_steps, tc.max_steps, tc.beta1, tc.beta2, tc.weight_decay,
+                             tc.grad_clip, 2000, 1, decay};
+        // warmup, the last warmup step, the first flat step, the last flat step, the first decay step, mid decay,
+        // the last step, and past the end
+        for (int step : {0, 9, 10, 69, 70, 85, 99, 100, 150})
+        {
+            float host = lr_at(step, tc);
+            float gpu = static_cast<float>(lr_on_gpu(step, sc));
+            if (host != gpu && fabs(host - gpu) > worst)
+            {
+                worst = fabs(host - gpu);
+                worst_step = step;
+            }
+        }
+    }
+    check(worst <= 1e-12, "cosine and WSD: the same lr on both sides at every step checked" +
+                              (worst_step >= 0 ? " (step " + to_string(worst_step) + ")" : string()));
+    TrainConfig w;
+    w.lr = 1e-3f;
+    w.min_lr = 1e-4f;
+    w.warmup_steps = 10;
+    w.max_steps = 100;
+    w.decay_steps = 30;
+    check(lr_at(10, w) == w.lr && lr_at(69, w) == w.lr, "WSD is flat at lr from the end of warmup to the decay");
+    check(lr_at(70, w) == w.lr && lr_at(99, w) > w.min_lr && lr_at(99, w) < lr_at(85, w) && lr_at(100, w) == w.min_lr,
+          "then falls to min_lr at max_steps");
+    double p = 15.0 / 30.0;
+    check(fabs(lr_at(85, w) - (1e-4 + 9e-4 * (1.0 - sqrt(p)))) < 1e-9, "mid decay: min + (lr - min) * (1 - sqrt(p))");
+}
+
+static void branch_checks(const Dump &d, const ModelConfig &cfg)
+{
+    printf("\nbranch: a WSD trunk, its step 10 checkpoint, and a longer branch from it\n");
+    int B = d.B, T = d.T;
+    Data data = make_data(cfg, B, T);
+    TrainConfig trunk = run_config(d);
+    trunk.max_steps = 30;
+    trunk.decay_steps = 10;                 // flat from step 4 to 19
+    TrainConfig twig = trunk;
+    twig.max_steps = 40;                    // the branch: flat to step 29, then its own decay
+    twig.decay_steps = 10;
+
+    vector<float> trunk_losses;
+    const string path = "test_checkpoint_branch.tmp.bin";
+    {
+        FastGPT m(cfg, B, T, trunk, SCALE, options());
+        m.load_params(d);
+        vector<float> first = run_steps(m, data, 0, HALF);
+        RunInfo run;
+        run.B = B;
+        run.max_steps = trunk.max_steps;
+        run.decay_steps = trunk.decay_steps;
+        write_checkpoint(path, checkpoint_of(m, run));
+        vector<float> second = run_steps(m, data, HALF, STEPS);
+        trunk_losses = first;
+        trunk_losses.insert(trunk_losses.end(), second.begin(), second.end());
+    }
+    FastGPT branched(cfg, B, T, twig, SCALE, options());
+    restore(branched, read_checkpoint(path));
+    remove(path.c_str());
+    vector<float> branch_losses = run_steps(branched, data, HALF, STEPS);
+    double gap = max_rel(vector<float>(trunk_losses.begin() + HALF, trunk_losses.end()), branch_losses);
+    StepState st = branched.read_state();
+    check(gap <= 1e-4, "steps 11 to 20, both flat: the branch has the trunk's losses (gap " + to_string(gap) + ")");
+    check(st.step == STEPS && st.adam_t == STEPS, "the branch kept the step and AdamW t from the checkpoint");
+    ScheduleConfig a = branched.sched, b = branched.sched;
+    b.max_steps = trunk.max_steps;
+    check(lr_on_gpu(25, a) == twig.lr && lr_on_gpu(25, b) < twig.lr,
+          "at step 25 the branch is still flat while the trunk decays");
+}
+
 int main(int argc, char *argv[])
 {
     string path = argc > 1 ? argv[1] : "data/ref/debug.bin";
@@ -330,6 +445,8 @@ int main(int argc, char *argv[])
     printf("==== %s: L %d H %d C %d B %u T %u\n", path.c_str(), cfg.L, cfg.H, cfg.C, d.B, d.T);
     file_checks(cfg);
     resume_checks(d, cfg);
+    schedule_checks();
+    branch_checks(d, cfg);
     printf("\n%s\n", g_checks_failed == 0 ? "checkpoints and resuming work"
                                           : (to_string(g_checks_failed) + " failure(s)").c_str());
     return g_checks_failed == 0 ? 0 : 1;
