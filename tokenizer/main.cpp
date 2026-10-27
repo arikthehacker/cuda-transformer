@@ -1,11 +1,13 @@
 // main.cpp: the "bpe" command line tool
 //
 //   bpe -t -i corpus.txt -n 4096 -o tokenizer.bpe -v     train
+//   bpe -t -i chat.txt -n 16384 -r "<web>,<user>,<assistant>" -o tokenizer.bpe    with reserved tags
 //   bpe -e -m tokenizer.bpe -i corpus.txt -o train.bin   encode
 //   bpe -d -m tokenizer.bpe -i train.bin [-o out.txt]    decode
 
 #include "bpe.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,10 @@ static void usage(const char *prog)
     printf("  -o file       output file\n");
     printf("  -m file       tokenizer file (for -e and -d)\n");
     printf("  -n #          vocab size: bytes + merges (default 4096)\n");
+    printf("  -p 1|2        pretokenizer for -t: 2 splits contractions and groups digits by 3 (default 2),\n");
+    printf("                1 is the stage 1 rules (encode and decode use what the tokenizer file says)\n");
+    printf("  -r tags       reserved tags for -t, comma separated: their ids come first, in this order,\n");
+    printf("                even if the text never has them (e.g. \"<web>,<user>,<assistant>\")\n");
     printf("  -v            verbose: print every 256th merge while training\n");
     printf("  -h            print this help message\n");
 }
@@ -156,7 +162,8 @@ static size_t count_chars(const string &text)
     return chars;
 }
 
-static int do_train(const string &in_path, const string &out_path, uint32_t vocab_size, bool verbose)
+static int do_train(const string &in_path, const string &out_path, uint32_t vocab_size, bool verbose, int pretok,
+                    const vector<string> &reserved)
 {
     string text;
     if (!read_file(in_path, text))
@@ -168,7 +175,7 @@ static int do_train(const string &in_path, const string &out_path, uint32_t voca
 
     auto t0 = chrono::steady_clock::now();
     Tokenizer tok;
-    train(tok, text, vocab_size, verbose);
+    train(tok, text, vocab_size, verbose, pretok, reserved);
     double secs = seconds_since(t0);
 
     if (tok.vocab.size() > 65536)
@@ -186,7 +193,7 @@ static int do_train(const string &in_path, const string &out_path, uint32_t voca
     printf("merges %zu, specials %zu (", tok.merges.size(), tok.specials.size());
     for (size_t k = 0; k < tok.specials.size(); k++)
         printf("%s%s", k > 0 ? " " : "", tok.specials[k].c_str());
-    printf("), vocab %zu, %.2f s -> %s\n", tok.vocab.size(), secs, out_path.c_str());
+    printf("), vocab %zu, pretokenizer v%d, %.2f s -> %s\n", tok.vocab.size(), tok.pretok, secs, out_path.c_str());
 
     if (tok.merges.size() + 256 < vocab_size)
         printf("note: stopped early, no pairs left to merge\n");
@@ -279,9 +286,11 @@ int main(int argc, char *argv[])
     string model_path;
     uint32_t vocab_size = 4096;
     bool verbose = false;
+    int pretok = 2;
+    vector<string> reserved;
     int opt = 0;
 
-    while ((opt = getopt(argc, argv, "tedi:o:m:n:vh")) != -1)
+    while ((opt = getopt(argc, argv, "tedi:o:m:n:p:r:vh")) != -1)
     {
         switch (opt)
         {
@@ -314,6 +323,37 @@ int main(int argc, char *argv[])
                 return 1;
             }
             vocab_size = static_cast<uint32_t>(v);
+            break;
+        }
+        case 'p':
+            if (string(optarg) != "1" && string(optarg) != "2")
+            {
+                fprintf(stderr, "error: -p takes 1 or 2\n");
+                return 1;
+            }
+            pretok = optarg[0] - '0';
+            break;
+        case 'r':
+        {
+            string list = optarg;
+            size_t at = 0;
+            while (at <= list.size())
+            {
+                size_t comma = list.find(',', at);
+                string name = list.substr(at, comma == string::npos ? string::npos : comma - at);
+                if (!is_tag_name(name))
+                {
+                    fprintf(stderr, "error: -r: \"%s\" is not a tag like <user>\n", name.c_str());
+                    return 1;
+                }
+                if (find(reserved.begin(), reserved.end(), name) != reserved.end())
+                {
+                    fprintf(stderr, "error: -r: %s is there twice\n", name.c_str());
+                    return 1;
+                }
+                reserved.push_back(name);
+                at = comma == string::npos ? list.size() + 1 : comma + 1;
+            }
             break;
         }
         case 'v':
@@ -351,7 +391,7 @@ int main(int argc, char *argv[])
     }
 
     if (mode == 't')
-        return do_train(in_path, out_path, vocab_size, verbose);
+        return do_train(in_path, out_path, vocab_size, verbose, pretok, reserved);
     if (mode == 'e')
         return do_encode(model_path, in_path, out_path);
     return do_decode(model_path, in_path, out_path);

@@ -4,7 +4,7 @@
 // train        learn merges with incremental pair counts + a lazy max heap
 // encode       apply merges to each unique word once, then reuse it (cache)
 // decode       join the bytes of each id
-// save / load  the plain text "bpe v1" format
+// save / load  the plain text "bpe v1" (pretok 1) or "bpe v2" (pretok 2) format
 
 #include "bpe.h"
 
@@ -87,14 +87,57 @@ static inline uint8_t unit_at(string_view s, size_t i, size_t &len)
     return class_of(s[i]);
 }
 
+// pretok 2: if a contraction starts at s[i] (an apostrophe, then s t m d re ve
+// or ll in either case, then no letter), its length in bytes, else 0.
+static size_t contraction_len(string_view s, size_t i)
+{
+    size_t n = s.size();
+    size_t a = 0;
+    if (s[i] == '\'')
+        a = 1;
+    else if (i + 2 < n && static_cast<unsigned char>(s[i]) == 0xE2 && static_cast<unsigned char>(s[i + 1]) == 0x80 &&
+             static_cast<unsigned char>(s[i + 2]) == 0x99)
+        a = 3;                                  // U+2019, the curly apostrophe
+    if (a == 0 || i + a >= n)
+        return 0;
+    auto lower = [&](size_t k) { return static_cast<char>(s[k] >= 'A' && s[k] <= 'Z' ? s[k] + 32 : s[k]); };
+    size_t k = i + a;
+    size_t m = 0;
+    if (k + 1 < n)
+    {
+        char x = lower(k), y = lower(k + 1);
+        if ((x == 'r' && y == 'e') || (x == 'v' && y == 'e') || (x == 'l' && y == 'l'))
+            m = 2;
+    }
+    if (m == 0)
+    {
+        char x = lower(k);
+        if (x == 's' || x == 't' || x == 'm' || x == 'd')
+            m = 1;
+    }
+    if (m == 0)
+        return 0;
+    size_t len = 0;
+    if (k + m < n && unit_at(s, k + m, len) == LETTER)
+        return 0;                               // "'sup", "'tis": a word, not a contraction
+    return a + m;
+}
+
 // Returns where the piece that starts at s[i] ends (one past its last byte).
 // This is the whole pretokenizer. pretokenize(), train() and encode() all use
 // it, so they always agree on the word boundaries.
-static size_t piece_end(string_view s, size_t i)
+static size_t piece_end(string_view s, size_t i, int pretok)
 {
     size_t n = s.size();
+    if (pretok >= 2)
+    {
+        size_t c_len = contraction_len(s, i);
+        if (c_len > 0)
+            return i + c_len;
+    }
     size_t len = 0;
     uint8_t c = unit_at(s, i, len);
+    size_t word = i;                            // where the word starts (after its one leading space)
     size_t j = i + len;
 
     if (c == SPACE)
@@ -107,6 +150,7 @@ static size_t piece_end(string_view s, size_t i)
         if (j - i > 1)
             return j - 1;       // leave the last space for the word after it
 
+        word = j;
         c = unit_at(s, j, len); // exactly one space: it leads the word
         j += len;
     }
@@ -114,16 +158,26 @@ static size_t piece_end(string_view s, size_t i)
     // a run of '\n', or a run of one word class
     while (j < n && unit_at(s, j, len) == c)
         j += len;
+
+    // pretok 2: digits in groups of 3 from the right, so "1234567" is 1 234 567.
+    // The first group takes what is left over; every later call starts on a
+    // run whose length is a multiple of 3 and takes exactly 3.
+    if (pretok >= 2 && c == DIGIT)
+    {
+        size_t digits = j - word;
+        size_t first = digits % 3 == 0 ? 3 : digits % 3;
+        return word + first;
+    }
     return j;
 }
 
-vector<string> pretokenize(const string &text)
+vector<string> pretokenize(const string &text, int pretok)
 {
     vector<string> pieces;
     string_view s(text);
     for (size_t i = 0; i < s.size(); )
     {
-        size_t j = piece_end(s, i);
+        size_t j = piece_end(s, i, pretok);
         pieces.emplace_back(text, i, j - i);
         i = j;
     }
@@ -145,6 +199,11 @@ static bool is_tag(string_view line)
             return false;
     }
     return true;
+}
+
+bool is_tag_name(const string &name)
+{
+    return is_tag(name);
 }
 
 static int find_special(Tokenizer &tok, string_view name, bool add_new)
@@ -400,13 +459,17 @@ static string show_token(const string &bytes)
     return out;
 }
 
-void train(Tokenizer &tok, const string &text, uint32_t vocab_size, bool verbose)
+void train(Tokenizer &tok, const string &text, uint32_t vocab_size, bool verbose, int pretok,
+           const vector<string> &reserved)
 {
     auto t0 = chrono::steady_clock::now();
 
     tok = Tokenizer();
+    tok.pretok = pretok;
     for (int b = 0; b < 256; b++)
         tok.vocab.push_back(string(1, static_cast<char>(b)));
+    for (const string &name : reserved)         // fixed ids first, before any tag the text holds
+        find_special(tok, name, true);
 
     // 1. Count unique words. The keys are views into segs, which lives until
     //    the end of this function, so no word gets copied.
@@ -421,7 +484,7 @@ void train(Tokenizer &tok, const string &text, uint32_t vocab_size, bool verbose
             string_view s(seg.text);
             for (size_t i = 0; i < s.size(); )
             {
-                size_t j = piece_end(s, i);
+                size_t j = piece_end(s, i, tok.pretok);
                 if (j - i >= 2)                     // 1 byte words have no pairs
                     word_counts[s.substr(i, j - i)]++;
                 pieces++;
@@ -673,7 +736,7 @@ vector<uint32_t> encode(Tokenizer &tok, const string &text)
             string_view s(seg.text);
             for (size_t i = 0; i < s.size(); )
             {
-                size_t j = piece_end(s, i);
+                size_t j = piece_end(s, i, tok.pretok);
                 if (j - i == 1)
                     out.push_back(static_cast<unsigned char>(s[i]));    // one byte, nothing to merge
                 else
@@ -727,7 +790,7 @@ bool save(const Tokenizer &tok, const string &path)
     if (!out)
         return false;
 
-    out << "bpe v1\n";
+    out << (tok.pretok >= 2 ? "bpe v2\n" : "bpe v1\n");
     out << "merges " << tok.merges.size() << "\n";
     for (const auto &m : tok.merges)
         out << m.first << " " << m.second << "\n";
@@ -750,12 +813,13 @@ bool load(Tokenizer &tok, const string &path)
     string version;
     string label;
     size_t count = 0;
-    if (!(in >> magic >> version) || magic != "bpe" || version != "v1")
+    if (!(in >> magic >> version) || magic != "bpe" || (version != "v1" && version != "v2"))
         return false;
     if (!(in >> label >> count) || label != "merges" || count > 65536 - 256)
         return false;
 
     Tokenizer t;
+    t.pretok = version == "v2" ? 2 : 1;
     for (int b = 0; b < 256; b++)
         t.vocab.push_back(string(1, static_cast<char>(b)));
 

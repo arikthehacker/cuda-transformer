@@ -65,7 +65,8 @@ static string sample_text()
 // rules as the header, but none of the incremental bookkeeping, so it is easy
 // to trust. Also returns the final tokens of the whole text.
 
-static vector<pair<uint32_t, uint32_t>> slow_train(const string &text, uint32_t vocab_size, vector<uint32_t> &final_ids)
+static vector<pair<uint32_t, uint32_t>> slow_train(const string &text, uint32_t vocab_size, vector<uint32_t> &final_ids,
+                                                   int pretok = 1)
 {
     Tokenizer scratch;
     vector<Segment> segs = split_specials(scratch, text, true);
@@ -81,7 +82,7 @@ static vector<pair<uint32_t, uint32_t>> slow_train(const string &text, uint32_t 
         }
         else
         {
-            for (const string &piece : pretokenize(seg.text))
+            for (const string &piece : pretokenize(seg.text, pretok))
             {
                 vector<uint32_t> ids;
                 for (char c : piece)
@@ -162,24 +163,24 @@ static vector<pair<uint32_t, uint32_t>> slow_train(const string &text, uint32_t 
 static void test_pretokenize()
 {
     printf("0. pretokenize\n");
-    check(pretokenize("Let there be light,") == vector<string>{"Let", " there", " be", " light", ","},
+    check(pretokenize("Let there be light,", 1) == vector<string>{"Let", " there", " be", " light", ","},
           "\"Let there be light,\" -> Let | there | be | light | ,");
-    check(pretokenize("  two  spaces ") == vector<string>{" ", " two", " ", " spaces", " "},
+    check(pretokenize("  two  spaces ", 1) == vector<string>{" ", " two", " ", " spaces", " "},
           "extra spaces split off, the last one leads the word");
-    check(pretokenize("it's 3:16!") == vector<string>{"it", "'", "s", " 3", ":", "16", "!"},
+    check(pretokenize("it's 3:16!", 1) == vector<string>{"it", "'", "s", " 3", ":", "16", "!"},
           "letters, digits, punctuation are separate runs");
-    check(pretokenize("end \n\nnext") == vector<string>{"end", " ", "\n\n", "next"},
+    check(pretokenize("end \n\nnext", 1) == vector<string>{"end", " ", "\n\n", "next"},
           "a run of newlines is one piece");
-    check(pretokenize("caf\xC3\xA9 \xF0\x9F\x98\x82!") == vector<string>{"caf\xC3\xA9", " \xF0\x9F\x98\x82", "!"},
+    check(pretokenize("caf\xC3\xA9 \xF0\x9F\x98\x82!", 1) == vector<string>{"caf\xC3\xA9", " \xF0\x9F\x98\x82", "!"},
           "UTF-8 bytes stay inside the word");
-    check(pretokenize("").empty(), "empty string gives no pieces");
-    check(pretokenize("said \xE2\x80\x9CLet") == vector<string>{"said", " \xE2\x80\x9C", "Let"},
+    check(pretokenize("", 1).empty(), "empty string gives no pieces");
+    check(pretokenize("said \xE2\x80\x9CLet", 1) == vector<string>{"said", " \xE2\x80\x9C", "Let"},
           "a curly quote is punctuation, not part of the word");
-    check(pretokenize("God\xE2\x80\x99s") == vector<string>{"God", "\xE2\x80\x99", "s"},
+    check(pretokenize("God\xE2\x80\x99s", 1) == vector<string>{"God", "\xE2\x80\x99", "s"},
           "a curly apostrophe splits like a straight one");
-    check(pretokenize("own.\xE2\x80\x94\xE2\x80\x9CVery") == vector<string>{"own", ".\xE2\x80\x94\xE2\x80\x9C", "Very"},
+    check(pretokenize("own.\xE2\x80\x94\xE2\x80\x9CVery", 1) == vector<string>{"own", ".\xE2\x80\x94\xE2\x80\x9C", "Very"},
           "ASCII and curly punctuation join one run");
-    check(pretokenize("ab\xE2\x80") == vector<string>{"ab\xE2\x80"},
+    check(pretokenize("ab\xE2\x80", 1) == vector<string>{"ab\xE2\x80"},
           "a cut off character stays with the word");
 }
 
@@ -380,6 +381,34 @@ static void test_against_slow()
     check(merge_mismatch == 0, to_string(trials) + " random texts: same merges");
     check(encode_mismatch == 0, to_string(trials) + " random texts: encode() gives the training split");
 
+    // pretokenizer v2: contractions and digit groups change the words, so the same check with them
+    const string v2_alphabet = "aabst1234567890''re  \n.";
+    int v2_merge_mismatch = 0, v2_encode_mismatch = 0, v2_round_trip = 0;
+    for (int t = 0; t < 200; t++)
+    {
+        size_t len = rng() % 300;
+        string text;
+        for (size_t k = 0; k < len; k++)
+        {
+            if (rng() % 50 == 0)
+                text += "\xE2\x80\x99";                // the curly apostrophe
+            else
+                text += v2_alphabet[rng() % v2_alphabet.size()];
+        }
+        uint32_t vocab_size = 256 + rng() % 60;
+        Tokenizer tok;
+        train(tok, text, vocab_size, false, 2);
+        vector<uint32_t> slow_ids;
+        vector<pair<uint32_t, uint32_t>> slow = slow_train(text, vocab_size, slow_ids, 2);
+        vector<uint32_t> ids = encode(tok, text);
+        v2_merge_mismatch += tok.merges != slow;
+        v2_encode_mismatch += ids != slow_ids;
+        v2_round_trip += decode(tok, ids) != text;
+    }
+    check(v2_merge_mismatch == 0, "200 random texts, pretokenizer v2: same merges");
+    check(v2_encode_mismatch == 0, "200 random texts, pretokenizer v2: encode() gives the training split");
+    check(v2_round_trip == 0, "200 random texts, pretokenizer v2: decode(encode(x)) == x");
+
     string path = "data/corpus_val.txt";
     if (file_exists(path))
     {
@@ -393,6 +422,86 @@ static void test_against_slow()
     }
 }
 
+// ------------------------------------------------------------- pretokenizer v2
+
+static void test_pretokenize_v2()
+{
+    printf("7. pretokenizer v2: contractions, digits in groups of 3, reserved tags, the v2 file\n");
+    struct Case
+    {
+        const char *text;
+        vector<string> want;
+        const char *what;
+    };
+    const Case cases[] = {
+        {"it's", {"it", "'s"}, "it's -> it 's"},
+        {"don't", {"don", "'t"}, "don't -> don 't"},
+        {"God\xE2\x80\x99s", {"God", "\xE2\x80\x99s"}, "God's with the curly apostrophe -> God 's"},
+        {"'sup", {"'", "sup"}, "'sup: a letter follows, so no contraction"},
+        {"rock 'n' roll", {"rock", " '", "n", "'", " roll"}, "rock 'n' roll: 'n is not a contraction"},
+        {"we're they've you'll I'd I'm", {"we", "'re", " they", "'ve", " you", "'ll", " I", "'d", " I", "'m"},
+         "'re 've 'll 'd 'm"},
+        {"I'M", {"I", "'M"}, "upper case: I'M -> I 'M"},
+        {" 1234567", {" 1", "234", "567"}, "\" 1234567\" -> \" 1\" \"234\" \"567\""},
+        {"2024", {"2", "024"}, "2024 -> 2 024"},
+        {" 7259", {" 7", "259"}, "\" 7259\" -> \" 7\" \"259\""},
+        {"3.14159", {"3", ".", "14", "159"}, "3.14159 -> 3 . 14 159"},
+        {" 12", {" 12"}, "\" 12\" stays one piece"},
+        {"1000000", {"1", "000", "000"}, "1000000 -> 1 000 000"},
+        {"it's 3:16!", {"it", "'s", " 3", ":", "16", "!"}, "it's 3:16! -> it 's 3 : 16 !"},
+    };
+    Tokenizer tok;
+    string all;
+    for (const Case &c : cases)
+        all += string(c.text) + "\n";
+    train(tok, sample_text() + all, 600, false, 2, {"<web>", "<user>", "<assistant>", "<system>"});
+    for (const Case &c : cases)
+    {
+        check(pretokenize(c.text, 2) == c.want, c.what);
+        check(decode(tok, encode(tok, c.text)) == c.text, string("  and it round trips: ") + c.text);
+    }
+    check(pretokenize("it's 1234", 1) == vector<string>{"it", "'", "s", " 1234"}, "pretok 1 keeps the stage 1 split");
+
+    // reserved tags come first, in order, whether or not the text has them
+    vector<string> want_tags = {"<web>", "<user>", "<assistant>", "<system>", "<bible>", "<austen>", "<stories>"};
+    check(tok.specials == want_tags, "reserved tags first, then the text's own tags");
+    uint32_t first = 256 + static_cast<uint32_t>(tok.merges.size());
+    check(encode(tok, "<user>\nhi\n")[0] == first + 1, "<user> has the second tag id");
+
+    // the file: v2 saves as "bpe v2" and loads back with its rules; v1 files still load as v1
+    string path = "test_v2_tmp.bpe";
+    save(tok, path);
+    string head;
+    {
+        ifstream in(path);
+        getline(in, head);
+    }
+    Tokenizer back;
+    bool loaded = load(back, path);
+    remove(path.c_str());
+    check(head == "bpe v2", "a pretok 2 tokenizer saves \"bpe v2\"");
+    check(loaded && back.pretok == 2 && back.specials == tok.specials && back.merges == tok.merges,
+          "and loads back with pretok 2");
+    check(encode(back, all) == encode(tok, all), "same encode() output after load");
+    {
+        ofstream f(path, ios::binary);
+        f << "bpe v1\nmerges 1\n49 50\nspecials 0\n";
+    }
+    Tokenizer old;
+    loaded = load(old, path);
+    remove(path.c_str());
+    check(loaded && old.pretok == 1, "a \"bpe v1\" file loads with pretok 1");
+    check(encode(old, "1234") == vector<uint32_t>{256, '3', '4'}, "and encodes with the stage 1 rules (1234 is one word)");
+    {
+        ofstream f(path, ios::binary);
+        f << "bpe v3\nmerges 0\nspecials 0\n";
+    }
+    Tokenizer future;
+    loaded = load(future, path);
+    remove(path.c_str());
+    check(!loaded, "load() refuses a version it does not know");
+}
+
 int main()
 {
     test_pretokenize();
@@ -402,6 +511,7 @@ int main()
     test_save_load();
     test_corpus_val();
     test_against_slow();
+    test_pretokenize_v2();
 
     if (failures == 0)
         printf("\nall checks passed\n");

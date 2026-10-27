@@ -13,6 +13,7 @@
 
 struct Tokenizer
 {
+    int pretok = 1;                                     // pretokenizer rules: 1 = stage 1, 2 = contractions + digit groups
     std::vector<std::pair<uint32_t, uint32_t>> merges;  // merges[i] makes id 256 + i
     std::vector<std::string> vocab;                     // vocab[id] = bytes for that id
     std::unordered_map<uint64_t, uint32_t> merge_id;    // pair_key(a, b) -> new id
@@ -44,15 +45,31 @@ std::vector<Segment> split_specials(Tokenizer &tok, const std::string &text, boo
 //       or anything else that is not space or '\n' (punctuation), including
 //       the General Punctuation block U+2000 to U+206F (curly quotes, dashes)
 // Example: "Let there be light," -> "Let" " there" " be" " light" ","
-std::vector<std::string> pretokenize(const std::string &text);
+//
+// pretok 2 (tokenizers saved as "bpe v2") adds two rules:
+//   an apostrophe (' or the curly U+2019) followed by s, t, m, d, re, ve or ll
+//   (either case) and then no letter is a piece of its own:
+//       "it's" -> "it" "'s", "don't" -> "don" "'t", but "'sup" -> "'" "sup"
+//   digits go in groups of 3 counted from the right:
+//       " 1234567" -> " 1" "234" "567", "2024" -> "2" "024"
+// A tokenizer keeps the rules it was trained with, so train() and encode()
+// always split the same way.
+std::vector<std::string> pretokenize(const std::string &text, int pretok);
+
+// "<" + one or more of [a-z_] + ">": what split_specials() turns into a tag
+bool is_tag_name(const std::string &name);
 
 // Learn merges until there are vocab_size ids (bytes + merges, specials not counted).
+// pretok picks the pretokenizer rules (1 or 2). reserved tags get the first
+// tag ids in this order even if the text never has them (each must pass
+// is_tag_name, no repeats); tags found in the text come after them.
 // Rules both your C++ and any reference version must follow exactly:
 //   count every adjacent pair, overlaps included ("aaa" has 2 of (a,a))
 //   pick the pair with the highest count
 //   tie: pick the smaller pair_key(a, b)
 //   merge left to right, without overlap ("aaa" -> [aa] a)
-void train(Tokenizer &tok, const std::string &text, uint32_t vocab_size, bool verbose);
+void train(Tokenizer &tok, const std::string &text, uint32_t vocab_size, bool verbose, int pretok = 1,
+           const std::vector<std::string> &reserved = {});
 
 // Encode: for each word, repeatedly find the pair with the LOWEST merge id
 // present in it and merge it everywhere left to right, until no pair has a merge.
