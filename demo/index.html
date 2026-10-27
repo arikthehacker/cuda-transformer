@@ -131,7 +131,7 @@ let running = false;
 // ---- tokenizer.bpe: merges build the byte strings, specials come after them
 function parseTokenizer(text) {
     const lines = text.split("\n");
-    if (!lines[0].startsWith("bpe v1")) throw new Error("not a tokenizer.bpe file");
+    if (!/^bpe v[12]\b/.test(lines[0])) throw new Error("not a tokenizer.bpe file");
     const merges = parseInt(lines[1].split(" ")[1], 10);
     const v = [];
     for (let b = 0; b < 256; b++) v.push(new Uint8Array([b]));

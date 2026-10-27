@@ -11,7 +11,8 @@ NEWLINE = 10                    # the byte after every tag line
 
 
 def load_bpe(path: str) -> tuple[list[bytes], dict[str, int]]:
-    """Read "bpe v1". Rebuild the vocab bytes from the merges the same way
+    """Read "bpe v1" or "bpe v2" (the version only says which pretokenizer
+    rules encode() uses, and nothing here encodes). Rebuild the vocab bytes from the merges the same way
     load() in bpe.cpp does, and return {"<bible>": id, ...} for the tags.
     Tag ids come after the merges: 256 + len(merges) + index."""
     with open(path, "r", encoding="utf-8", newline="") as f:
@@ -20,8 +21,8 @@ def load_bpe(path: str) -> tuple[list[bytes], dict[str, int]]:
     def fail(why: str) -> ValueError:
         return ValueError(f"{path}: {why}")
 
-    if lines[0].split() != ["bpe", "v1"]:
-        raise fail(f"first line is {lines[0]!r}, expected 'bpe v1'")
+    if lines[0].split() not in (["bpe", "v1"], ["bpe", "v2"]):
+        raise fail(f"first line is {lines[0]!r}, expected 'bpe v1' or 'bpe v2'")
     head = lines[1].split()
     if len(head) != 2 or head[0] != "merges":
         raise fail(f"second line is {lines[1]!r}, expected 'merges N'")

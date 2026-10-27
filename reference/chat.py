@@ -166,21 +166,28 @@ def prepare(tokens: np.ndarray, tags: dict[str, int], n_ctx: int) -> tuple[np.nd
     return cut_to_context(y, starts, n_ctx, tokens.size)
 
 
-CHAT_TAGS = {"<web>", "<user>", "<assistant>"}
+CHAT_TAGS = ("<web>", "<user>", "<assistant>")
+# bpe -t -r reserves these (make chat-tokens), so a later stage can use a tag
+# without a new tokenizer. Rows of tags the data never has stay near their init.
+RESERVED = ("<system>", "<tool>", "<code>", "<book>")
 
 
 def check_tokenizer(path: str) -> None:
-    """Exit with a message unless the tokenizer's tags are exactly <web>, <user>,
-    <assistant>: one stray tag-shaped line in the training text adds a special
-    token for good, so this is checked before encoding anything."""
+    """Exit with a message unless the tokenizer has <web>, <user> and <assistant>,
+    and every other tag is one of RESERVED: one stray tag-shaped line in the
+    training text adds a special token for good, so this is checked before
+    encoding anything. Also counts the ids that are only digits."""
     vocab, tags = load_bpe(path)
-    if set(tags) != CHAT_TAGS:
-        extra = sorted(set(tags) - CHAT_TAGS)
-        missing = sorted(CHAT_TAGS - set(tags))
-        raise SystemExit(f"{path}: specials {len(tags)} ({' '.join(tags)}), want exactly 3 (<web> <user> <assistant>)"
+    missing = [t for t in CHAT_TAGS if t not in tags]
+    extra = [t for t in tags if t not in CHAT_TAGS and t not in RESERVED]
+    if missing or extra:
+        raise SystemExit(f"{path}: specials {len(tags)} ({' '.join(tags)})"
                          + (f"; extra: {' '.join(extra)} (a tag-shaped line got past safe_lines)" if extra else "")
                          + (f"; missing: {' '.join(missing)}" if missing else ""))
-    print(f"{path}: {len(vocab):,} ids, specials 3 ({' '.join(tags)}), nothing else")
+    digits = sum(1 for i, v in enumerate(vocab) if i >= 256 and i not in tags.values() and v.strip(b" ").isdigit()
+                 and not v.startswith(b"  "))
+    print(f"{path}: {len(vocab):,} ids, specials {len(tags)} ({' '.join(tags)}), nothing else; "
+          f"{digits:,} learned ids are only digits (at most 2,220 with groups of 3)")
 
 
 def main(argv: list[str] | None = None) -> None:
