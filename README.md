@@ -406,8 +406,8 @@ in every 100 goes to `pretrain_val.txt`. smol-smoltalk's train and test splits b
 turns that end with a `<user>` line of its own, so the model learns where an answer
 stops. System messages are left out, since `make chat` has no system prompt.
 
-`make chat-tokens` trains the tokenizer on the first 300 MB of web text and every
-conversation, then stops if the tokenizer has any tag besides the three. It encodes
+`make chat-tokens` trains the tokenizer on the first 300 MB of web text and the first
+300 MB of conversations, then stops if the tokenizer has any tag besides the three. It encodes
 every text file, joins the web text's token files into `pretrain_train.bin`, and writes
 the SFT targets (see the chat model part of how it works). Last, `reference/export.py --init` writes PyTorch's starting
 weights for the chat size to `data/chat/init.bin`, so the CUDA trainer starts from the

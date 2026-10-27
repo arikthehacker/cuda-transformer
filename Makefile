@@ -284,7 +284,7 @@ chat-data:
 # the tokenizer, then every text file as BPE1 tokens, the SFT targets, and PyTorch's starting weights
 chat-tokens: $(BUILD)/bpe
 	head -c 300000000 $(CHAT)/pretrain_000.txt | sed '$$d' > $(CHAT)/tok_sample.txt
-	cat $(CHAT)/sft_train.txt >> $(CHAT)/tok_sample.txt
+	head -c 300000000 $(CHAT)/sft_train.txt | sed '$$d' >> $(CHAT)/tok_sample.txt
 	./$(BUILD)/bpe -t -i $(CHAT)/tok_sample.txt -n 16384 -o $(CHAT_TOK) -v
 	python.exe -m reference.chat --check-tokenizer $(CHAT_TOK)
 	for f in $(CHAT)/pretrain_[0-9][0-9][0-9].txt; do \
