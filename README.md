@@ -1163,8 +1163,10 @@ if (rename(tmp.c_str(), path.c_str()) != 0)
 the saved step. `test_checkpoint` trains 20 steps straight, then 10 steps, a
 checkpoint, a new model loaded from the file and 10 more, and the losses must match
 bit for bit. On a GPU, the sums that use atomics add in a different order on every run,
-so the test first runs the 20 steps twice to see how far two straight runs drift, and
-holds the resumed run to that.
+so two straight runs already drift apart, by up to about 1e-5 in the loss. The test
+then holds the resumed run to fixed bars, 1e-4 in the losses and 1e-2 in the
+parameters. A resume that loses AdamW's m and v or its step count moves the losses by
+1e-2 or more, so it still fails.
 
 **Chat in the KV cache.** A message goes in one token at a time. Each token runs
 through every layer to put its keys and values in the cache, and the next token is

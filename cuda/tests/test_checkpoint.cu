@@ -15,8 +15,11 @@
 // two runs of the SAME 20 steps can already differ in the last bits. The
 // test runs the straight 20 steps twice first: if those match bit for bit
 // (the CPU emulator, or a GPU that happens to), the resumed run must match
-// bit for bit too; if not, it must be as close to the straight run as the
-// two straight runs are to each other.
+// bit for bit too. If not, fixed bars: on the 2080 two straight runs differ
+// by at most about 1e-5 in the losses and 2e-3 in the parameters (largest
+// difference over the largest value), while a resume that loses AdamW's m
+// and v or its step count moves the losses by 1e-2 or more. The noise of one
+// pair of runs swings by 1,000 times between runs, so it makes a poor bar.
 
 #include <algorithm>
 #include <cmath>
@@ -239,6 +242,20 @@ static double max_rel(const vector<float> &a, const vector<float> &b)
     return worst;
 }
 
+// Largest difference over the largest value: a weight near 0 does not blow it up
+static double max_scaled(const vector<float> &a, const vector<float> &b)
+{
+    double diff = 0.0, scale = 0.0;
+    for (size_t i = 0; i < a.size() && i < b.size(); i++)
+    {
+        diff = max(diff, fabs(static_cast<double>(a[i]) - b[i]));
+        scale = max(scale, fabs(static_cast<double>(a[i])));
+    }
+    return diff / max(1e-30, scale);
+}
+
+static const double LOSS_BAR = 1e-4, PARAM_BAR = 1e-2;
+
 static void resume_checks(const Dump &d, const ModelConfig &cfg)
 {
     printf("\nresume: %d steps straight against %d, a checkpoint file, a new model, %d more\n", STEPS, HALF, HALF);
@@ -288,13 +305,14 @@ static void resume_checks(const Dump &d, const ModelConfig &cfg)
     }
     double noise = max_rel(straight[0], straight[1]);
     double loss_gap = max_rel(straight[0], resumed_all);
-    double param_noise = max_rel(straight_params[0], straight_params[1]);
-    double param_gap = max_rel(straight_params[0], params);
+    double param_noise = max_scaled(straight_params[0], straight_params[1]);
+    double param_gap = max_scaled(straight_params[0], params);
+    bool exact = noise == 0.0 && param_noise == 0.0;
     printf("  two straight runs differ by %.3g (losses), %.3g (params): %s\n", noise, param_noise,
-           noise == 0.0 && param_noise == 0.0 ? "deterministic, so the resumed run must match bit for bit"
-                                               : "the atomics' order, so the bar is that noise");
-    bool losses_ok = noise == 0.0 ? loss_gap == 0.0 : loss_gap <= max(4.0 * noise, 1e-6);
-    bool params_ok = param_noise == 0.0 ? param_gap == 0.0 : param_gap <= max(4.0 * param_noise, 1e-6);
+           exact ? "deterministic, so the resumed run must match bit for bit"
+                 : "the atomics' order, so the bars are fixed (losses 1e-4, params 1e-2)");
+    bool losses_ok = exact ? loss_gap == 0.0 : loss_gap <= LOSS_BAR;
+    bool params_ok = exact ? param_gap == 0.0 : param_gap <= PARAM_BAR;
     check(losses_ok, "losses of steps 11 to 20 after the resume (gap " + to_string(loss_gap) + ")");
     check(params_ok, "parameters after 20 steps (gap " + to_string(param_gap) + ")");
     check(end.step == STEPS && end.adam_t == straight_end[0].adam_t && end.skipped == straight_end[0].skipped &&
