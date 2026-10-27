@@ -5,14 +5,15 @@
 #   bash bench/sweep_lr.sh                 every run into data/chat/sweep/<lr>_<beta2>/
 #   python3 bench/sweep_summary.py         the table -> bench/results_sweep.md
 #
-# lr {6e-4, 1.2e-3, 2e-3} x beta2 {0.95, 0.99}, min_lr = lr / 10, warmup 2,000,
+# lr {6e-4, 2e-3, 6e-3} x beta2 {0.95, 0.99}, min_lr = lr / 10, warmup 2,000,
 # WSD with the last 2,440 steps (20%) decaying. The baseline (6e-4, 0.95) runs
 # twice: the gap between those two is the noise floor.
 #
 # Every run checkpoints after each eval. Running the script again skips the
 # runs that finished (weights.bin is there) and resumes the one that stopped
 # (ckpt.bin without weights.bin), so a power cut costs at most one eval window.
-# Extra runs: LRS="3e-3" AA=0 bash bench/sweep_lr.sh (both beta2 values, no second A/A run).
+# The lrs are about 3x apart because the fits for 20-60M models put the best AdamW lr at 2e-3 to 1e-2.
+# Extra runs: LRS="1e-2" AA=0 bash bench/sweep_lr.sh (both beta2 values, no second A/A run).
 
 set -u
 cd "$(dirname "$0")/.."
@@ -21,7 +22,7 @@ CHAT=${CHAT:-data/chat}
 OUT=${OUT:-$CHAT/sweep}
 STEPS=${STEPS:-12200}
 DECAY=${DECAY:-2440}
-LRS=${LRS:-"6e-4 1.2e-3 2e-3"}
+LRS=${LRS:-"6e-4 2e-3 6e-3"}
 BETA2S=${BETA2S:-"0.95 0.99"}
 AA=${AA:-1}
 

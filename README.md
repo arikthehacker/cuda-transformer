@@ -418,8 +418,10 @@ weights for the chat size to `data/chat/init.bin`, so the CUDA trainer starts fr
 same numbers PyTorch would.
 
 `make sweep` runs 7 pretraining runs of 100M tokens each, on exactly the same batches:
-learning rates 6e-4, 1.2e-3 and 2e-3, each with beta2 0.95 and 0.99, and the 6e-4 and
-0.95 run a second time. Two runs of the same settings differ only by the order of the
+learning rates 6e-4, 2e-3 and 6e-3, each with beta2 0.95 and 0.99, and the 6e-4 and
+0.95 run a second time. The learning rates are about 3 times apart because scaling fits
+for models of 20M to 60M parameters put the best AdamW learning rate between 2e-3 and
+1e-2, so 6e-4 is probably too low. Two runs of the same settings differ only by the order of the
 GPU's atomic adds, so the gap between them is the noise floor, and anything smaller than
 about twice that is a tie. The table goes to `bench/results_sweep.md`, and the winner's
 numbers go to `make chat-pretrain LR=... MIN_LR=... BETA2=...`.

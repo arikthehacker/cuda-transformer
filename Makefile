@@ -326,7 +326,7 @@ chat-branch: $(BUILD)/train_fast
 	$(if $(RESUME),./$(BUILD)/train_fast -c $(OUT) -r,./$(BUILD)/train_fast --branch $(FROM) -D $(CHAT)/pretrain \
 		-n $(N) --decay-steps $(DECAY) -c $(OUT))
 
-# 7 runs of 100M tokens on the same batches: lr {6e-4, 1.2e-3, 2e-3} x beta2 {0.95, 0.99}, and the
+# 7 runs of 100M tokens on the same batches: lr {6e-4, 2e-3, 6e-3} x beta2 {0.95, 0.99}, and the
 # baseline twice (the A/A run gives the noise floor) -> bench/results_sweep.md
 sweep: $(BUILD)/train_fast
 	bash bench/sweep_lr.sh

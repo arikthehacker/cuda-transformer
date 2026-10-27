@@ -78,9 +78,11 @@ def main() -> None:
     lines.append("Every run's first step had the same train loss, so the batches and the init match."
                  if len(firsts) == 1 else
                  f"The first step's train loss differs between runs ({len(firsts)} values): check the batches and init.")
-    if best.startswith("2e-3"):
-        lines.append("The best lr is the largest one tried: add 3e-3 "
-                     "(LRS=3e-3 AA=0 bash bench/sweep_lr.sh) before deciding.")
+    largest = max(float(n.split("_")[0]) for n in runs)
+    if float(best.split("_")[0]) == largest:
+        bigger = f"{largest * 5 / 3:.0e}".replace("e-0", "e-")
+        lines.append(f"The best lr is the largest one tried: add {bigger} "
+                     f"(LRS={bigger} AA=0 bash bench/sweep_lr.sh) before deciding.")
     lines.append(f"Best: lr {best.split('_')[0]}, beta2 {best.split('_')[1]}.")
 
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
