@@ -52,6 +52,16 @@ float lr_at(int step, const TrainConfig &tc)
     {
         return tc.min_lr;
     }
+    if (tc.decay_steps > 0)                 // WSD: flat at lr, then 1 - sqrt down to min_lr over the last decay_steps
+    {
+        int decay_from = tc.max_steps - tc.decay_steps;
+        if (step < decay_from)
+        {
+            return tc.lr;
+        }
+        double p = static_cast<double>(step - decay_from) / tc.decay_steps;
+        return static_cast<float>(tc.min_lr + (static_cast<double>(tc.lr) - tc.min_lr) * (1.0 - sqrt(p)));
+    }
     double progress = static_cast<double>(step - tc.warmup_steps) / max(1, tc.max_steps - tc.warmup_steps);
     return static_cast<float>(tc.min_lr + 0.5 * (1.0 + cos(pi * progress)) * (tc.lr - tc.min_lr));
 }

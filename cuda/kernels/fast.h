@@ -129,7 +129,11 @@ struct ScheduleConfig       // the numbers finalize needs, same values as TrainC
     float grad_clip;
     int growth_interval;    // 2,000: finite steps in a row before S doubles
     int dynamic_scale;      // 0: S stays where it is (the fp32 build)
+    int decay_steps;        // 0: cosine after warmup; > 0: WSD, flat at lr, then 1 - sqrt to min_lr over these last steps
 };
+
+// The lr of 0-based step on the GPU, the same numbers as lr_at() on the host (scaler.cu)
+double lr_on_gpu(int step, ScheduleConfig cfg);
 
 // a fresh state: S = scale, every counter 0
 StepState initial_state(float scale);

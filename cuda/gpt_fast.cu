@@ -140,7 +140,7 @@ FastGPT::FastGPT(const ModelConfig &c, int b, int t, const TrainConfig &tc, floa
     state = DeviceArray<StepState>(1);
     history = DeviceArray<StepState>(history_len);
     sched = {tc.lr, tc.min_lr, tc.warmup_steps, tc.max_steps, tc.beta1, tc.beta2, tc.weight_decay, tc.grad_clip,
-             2000, 1};
+             2000, 1, tc.decay_steps};
 #ifndef FP16
     sched.dynamic_scale = 0;                // fp32 cannot overflow here; S stays a fixed power of two
 #endif

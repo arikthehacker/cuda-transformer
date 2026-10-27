@@ -76,11 +76,39 @@ __device__ double lr_schedule(int step, const ScheduleConfig &cfg)
     {
         return cfg.min_lr;
     }
+    if (cfg.decay_steps > 0)                // WSD: flat at lr, then 1 - sqrt down to min_lr over the last decay_steps
+    {
+        int decay_from = cfg.max_steps - cfg.decay_steps;
+        if (step < decay_from)
+        {
+            return cfg.lr;
+        }
+        double p = static_cast<double>(step - decay_from) / cfg.decay_steps;
+        return cfg.min_lr + (static_cast<double>(cfg.lr) - cfg.min_lr) * (1.0 - sqrt(p));
+    }
     int span = cfg.max_steps - cfg.warmup_steps;
     double progress = static_cast<double>(step - cfg.warmup_steps) / (span > 1 ? span : 1);
     double span_lr = static_cast<double>(cfg.lr) - cfg.min_lr;
     return cfg.min_lr + 0.5 * (1.0 + cos(3.14159265358979323846 * progress)) * span_lr;
 }
+
+__global__ void lr_probe_kernel(double *out, int step, ScheduleConfig cfg)
+{
+    *out = lr_schedule(step, cfg);
+}
+
+double lr_on_gpu(int step, ScheduleConfig cfg)
+{
+    double *d = nullptr;
+    double h = 0.0;
+    CUDA_CHECK(cudaMalloc(&d, sizeof(double)));
+    lr_probe_kernel<<<1, 1>>>(d, step, cfg);
+    CUDA_CHECK_LAUNCH();
+    CUDA_CHECK(cudaMemcpy(&h, d, sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d));
+    return h;
+}
+
 
 // One block of NORM_BLOCKS threads. The partial sums are added in double in
 // a fixed tree, so the norm comes out the same every run.

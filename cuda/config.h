@@ -30,6 +30,7 @@ struct TrainConfig
     float lr = 6e-4f;
     float min_lr = 6e-5f;
     int warmup_steps = 200;
+    int decay_steps = 0;        // 0: cosine to min_lr; > 0: WSD (warmup, flat, 1 - sqrt decay over the last decay_steps)
     float weight_decay = 0.1f;
     float beta1 = 0.9f;
     float beta2 = 0.95f;
@@ -42,5 +43,7 @@ struct TrainConfig
 };
 
 // Linear warmup to lr over warmup_steps, then cosine down to min_lr at
-// max_steps. step is 0-based, same as lr_at() in reference/train.py.
+// max_steps, or with decay_steps > 0 (WSD) flat at lr until the last
+// decay_steps, then min_lr + (lr - min_lr) * (1 - sqrt(p)). step is 0-based,
+// same as lr_at() in reference/train.py and lr_schedule() on the GPU.
 float lr_at(int step, const TrainConfig &tc);
