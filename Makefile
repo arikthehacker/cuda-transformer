@@ -268,8 +268,8 @@ CHAT       = data/chat
 CHAT_TOK   = $(CHAT)/tokenizer.bpe
 MASKED     = data/ref/debug_chat_masked.bin
 # B 16 x T 512 = 8,192 tokens a step: 30,000 steps is 246M tokens, the full
-# 1B token set is about 122,000. SFT: 6,000 steps draws about 96k of the
-# ~460k conversations; one draw each is about 29,000.
+# 1B token set is about 122,000. SFT: 6,000 steps draws 96k of the 413k
+# conversations whose answer fits in 512 tokens; one draw each is about 26,000.
 CHAT_STEPS ?= 30000
 SFT_STEPS  ?= 6000
 # make chat-pretrain RESUME=1 (or chat-sft) picks a stopped run up from its last checkpoint

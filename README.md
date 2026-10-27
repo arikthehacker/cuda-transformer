@@ -415,8 +415,8 @@ same numbers PyTorch would.
 
 `make chat-pretrain` trains on batches of 16 x 512 tokens, so its 30,000 steps cover
 246M tokens. The whole set is about 1B tokens, and `make chat-pretrain
-CHAT_STEPS=122000` trains on all of it, an estimated 4.5 hours at 60,000 tokens per
-second. A checkpoint goes to `data/chat/pre/ckpt.bin` after every eval, and if the
+CHAT_STEPS=122000` trains on all of it, about 3.5 hours at the 82,000 tokens per
+second a short test run measured. A checkpoint goes to `data/chat/pre/ckpt.bin` after every eval, and if the
 computer stops, `make chat-pretrain RESUME=1` carries on from the last one with the
 same batches and settings. If the PC shuts down under the load, `nvidia-smi -pl 180`
 in an administrator terminal on Windows lowers the card's power limit until the next
@@ -424,9 +424,9 @@ restart.
 
 `make chat-sft` starts from the pretrained weights with a fresh optimizer, a learning
 rate of 1e-4 instead of 6e-4 and 100 warmup steps. Every batch row starts at the
-beginning of a conversation, and the loss counts only the answers. 6,000 steps draw
-about 96,000 of the 460,000 conversations, and `SFT_STEPS=29000` draws each one once
-on average. `make chat-results` and then `make results` put both runs into the results
+beginning of a conversation, and the loss counts only the answers. 412,948 of the
+460,083 conversations have an answer that fits in 512 tokens. 6,000 steps draw 96,000
+of them, and `SFT_STEPS=26000` draws each one once on average. `make chat-results` and then `make results` put both runs into the results
 section.
 
 `make chat` runs `./build/generate --chat`. Each line typed in is one message, and an
