@@ -8,6 +8,7 @@ It only copies what the benchmarks wrote (nothing here makes up a number):
     bench/results_gemm.md       ./build/bench_gemm
     bench/results_curves.md     python3 bench/curves.py      (and bench/curves.svg)
     bench/results_generate.md   ./build/generate -b -o bench/results_generate.md
+    bench/results_curves_chat.md  make chat-compare           (and bench/curves_chat.svg)
     bench/results_sweep.md      make sweep
     bench/results_chat.md       python3 bench/chat_results.py   (after make chat-pretrain and chat-sft)
 A missing file shows up as "not measured yet" in its subsection.
@@ -30,6 +31,8 @@ PARTS = [
      "PyTorch fast mode and train_fast on the same batches (reference/train.py --starts, train_fast -s)."),
     ("generation", "bench/results_generate.md",
      "Tokens per second for one sample, prompt and every cache rollover included."),
+    ("loss curves at the chat size", "bench/results_curves_chat.md",
+     "The same comparison for the chat model, 500 steps from data/chat/init.bin (make chat-compare)."),
     ("learning rate sweep", "bench/results_sweep.md",
      "lr x beta2 at the chat size, 100M tokens each, the same batches (bench/sweep_lr.sh, bench/sweep_summary.py)."),
     ("chat model", "bench/results_chat.md",
@@ -42,8 +45,9 @@ def section() -> str:
     out = [START, "## results", ""]
     for title, path, about in PARTS:
         out += [f"### {title}", "", about, ""]
-        if title == "loss curves" and os.path.exists("bench/curves.svg"):
-            out += ["![loss curves of PyTorch fast mode and train_fast](bench/curves.svg)", ""]
+        svg = {"loss curves": "bench/curves.svg", "loss curves at the chat size": "bench/curves_chat.svg"}.get(title)
+        if svg and os.path.exists(svg):
+            out += [f"![loss curves of PyTorch fast mode and train_fast]({svg})", ""]
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 out += [f.read().rstrip(), ""]

@@ -1,0 +1,3 @@
+- PyTorch fast: val 6.0320 at step 500
+- CUDA (train_fast): val 6.0320 at step 500
+- difference at step 500: +0.00% (the bar is about 1%)
