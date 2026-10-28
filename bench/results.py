@@ -11,6 +11,7 @@ It only copies what the benchmarks wrote (nothing here makes up a number):
     bench/results_curves_chat.md  make chat-compare           (and bench/curves_chat.svg)
     bench/results_sweep.md      make sweep
     bench/results_chat.md       python3 bench/chat_results.py   (after make chat-pretrain and chat-sft)
+    bench/results_collapse.md   make chat-collapse
 A missing file shows up as "not measured yet" in its subsection.
 """
 from __future__ import annotations
@@ -38,6 +39,10 @@ PARTS = [
     ("chat model", "bench/results_chat.md",
      "L 8, H 8, C 512, n_ctx 512, 33.9M parameters, batch 16 x 512 tokens. Pretrained on FineWeb-Edu, then "
      "fine-tuned on smol-smoltalk (bench/chat_results.py reads both train_fast logs)."),
+    ("softmax collapse", "bench/results_collapse.md",
+     "How many right tokens get a probability of exactly 1, and so a gradient of 0, over both chat models' "
+     "whole validation text (make chat-collapse). The fp16 and bf16 columns count where a softmax done in that "
+     "format would round to 1."),
 ]
 
 

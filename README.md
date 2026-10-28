@@ -395,6 +395,7 @@ make chat-compare       # PyTorch and train_fast on the same 500 batches
 make sweep              # 7 short runs pick the learning rate and beta2
 make chat-pretrain      # 122,000 steps (1B tokens) on web text
 make chat-sft           # 26,000 steps on the answers of the conversations
+make chat-collapse      # how often a token's gradient rounds to 0
 make chat               # talk to it
 make demo-chat          # put it in the browser demo
 make serve-demo         # then open http://localhost:8000
@@ -1242,6 +1243,37 @@ numbers are the same as before. `test_fast` checks the masked loss, the gradient
 the zero rows against `reference/dump.py --config chat --masked`, a dump with about
 half its targets set to -1 and one row with none counted at all.
 
+**Softmax collapse.** The logits are the model's scores for every token in the
+vocabulary, and softmax turns them into probabilities. After the -1 check, the kernel
+computes the loss and its gradient with the textbook formula, the same one PyTorch
+uses. `lt` is the right token's logit, `m` is the row's largest, `sum` adds up
+`exp(logit - m)` over the row, `p` is one token's probability, and `k` is the loss scale
+divided by the count:
+
+```cpp
+losses[n] = m + logf(sum) - lt;
+...
+float p = expf(to_float(l[j]) - m) / sum;
+d = (p - (j == target ? 1.0f : 0.0f)) * k;
+```
+
+[Barron, Gnanapragasam and Tschannen (2026)](https://arxiv.org/abs/2610.31642) found two
+rounding bugs in this formula. The first, softmax collapse, happens when the model is
+almost sure of the right token. The other tokens' terms are then too small to change
+`sum`, which rounds to exactly 1, so the right token's probability is exactly 1 and its
+loss and gradient come out as 0, while the wrong tokens still get their small gradients.
+With 32-bit floats it starts when the right token's logit is about 16.6 above the rest.
+`make chat-collapse` runs both chat models over their whole validation text in fp16, as
+`train_fast` does, and repeats the kernel's math for every token. Of the 5.3 million
+answer tokens, 4 collapsed, each one " as" after ", such", and none of the 10.4 million
+web tokens did. The kernels read the logits as fp16 but do this math in 32-bit floats,
+which is what keeps the count that low. In fp16, the same math would round about
+109,000 of the answer tokens to 1. The paper's fix rewrites the formula so it never
+adds a tiny number to 1. The kernels here keep the textbook form, since collapse is
+that rare at this size. The second bug, softmax cancellation, only affects
+distillation, training one model to copy another model's probabilities, which this
+repo does not do.
+
 **1B tokens on the GPU.** The pretraining tokens stay on the GPU as 16-bit ids, 2 GB
 for 1B tokens instead of 4 GB as 32-bit ints, and the batch kernel widens them as it
 copies a batch out. On the PyTorch side, a token file that big stays in CPU memory and
@@ -1452,6 +1484,15 @@ L 8, H 8, C 512, n_ctx 512, 33.9M parameters, batch 16 x 512 tokens. Pretrained 
 | SFT (smol-smoltalk, answers only) | 26,000 | 213M | 3.384 | 1.757 (step 26,000) | 1.757 | 0.5799 | 91,222 | 0.65 | 4,798 of 8,192 |
 
 The SFT val loss counts only the answer tokens of smol-smoltalk's test split, so it is not on the same scale as the pretraining val loss. Bits per byte leave the tags out and do not depend on the tokenizer.
+
+### softmax collapse
+
+How many right tokens get a probability of exactly 1, and so a gradient of 0, over both chat models' whole validation text (make chat-collapse). The fp16 and bf16 columns count where a softmax done in that format would round to 1.
+
+| validation text | model | tokens | fp32 (these kernels) | fp16 | bf16 |
+|---|---|---|---|---|---|
+| smol-smoltalk test split, answers | SFT | 5,304,632 | 4 (<0.01%) | 109,433 (2.06%) | 371,609 (7.01%) |
+| FineWeb-Edu val | pretrained | 10,426,368 | 0 | 24,923 (0.24%) | 144,794 (1.39%) |
 
 <!-- results end -->
 

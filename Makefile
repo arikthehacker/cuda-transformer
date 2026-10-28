@@ -375,5 +375,9 @@ demo-chat: demo/forward.wasm $(BUILD)/bpe
 chat-results:
 	python3 bench/chat_results.py
 
+# how often the cross entropy kernels round the right token's gradient to 0, on both val sets
+chat-collapse:
+	python.exe -m bench.collapse
+
 .PHONY: chat-data chat-tokens chat-pretrain chat-branch sweep chat-sft chat-compare chat test-chat demo-chat \
-        chat-results
+        chat-results chat-collapse
