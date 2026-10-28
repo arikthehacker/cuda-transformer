@@ -253,11 +253,13 @@ demo: demo/forward.wasm
 	cp data/tokenizer.bpe demo/tokenizer.bpe
 	@test -f demo/weights16.bin || echo "next: python.exe -m reference.export --fp16 --out demo/weights16.bin"
 
-test-demo: demo/forward.wasm
+test-demo: demo/forward.wasm $(BUILD)/bpe
 	python3 -m reference.export --from-dump $(DUMP) --out data/ref/weights_debug.bin
 	node demo/test_forward.mjs demo/forward.wasm data/ref/weights_debug.bin $(DUMP)
+	node demo/test_bpe.mjs $(BUILD)/bpe data/tokenizer.bpe data/corpus_val.txt
 
-serve-demo: demo
+# serves whichever model make demo or make demo-chat put in demo/
+serve-demo: demo/forward.wasm
 	python3 -m http.server 8000 -d demo
 
 .PHONY: demo test-demo serve-demo
@@ -364,8 +366,9 @@ test-chat: $(BUILD)/test_fast $(BUILD)/test_fast32 $(BUILD)/test_checkpoint $(BU
 	./$(BUILD)/test_generate $(DUMP)
 
 # the chat model in the browser: about 68 MB of fp16 weights (34M parameters)
-demo-chat: demo/forward.wasm
+demo-chat: demo/forward.wasm $(BUILD)/bpe
 	cp $(CHAT_TOK) demo/tokenizer.bpe
+	node demo/test_bpe.mjs $(BUILD)/bpe $(CHAT_TOK) $(CHAT)/sft_val.txt
 	python.exe -m reference.export --weights $(CHAT)/sft/weights.bin --fp16 --out demo/weights16.bin
 
 # the chat rows of the results section, from both training logs

@@ -3,154 +3,180 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tiny GPT in the browser</title>
+<title>babyCUDA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Yuji+Syuku&display=swap" rel="stylesheet">
 <style>
 :root {
-    --paper: #f6f1ea;
-    --card: #fffdf9;
-    --ink: #2b2622;
-    --soft: #6f655d;
-    --line: #e3d9cd;
-    --accent: #a85c6f;
-    --accent-ink: #ffffff;
-}
-@media (prefers-color-scheme: dark) {
-    :root {
-        --paper: #1d1a18;
-        --card: #262220;
-        --ink: #efe7de;
-        --soft: #a89c91;
-        --line: #3a342f;
-        --accent: #d48a9c;
-        --accent-ink: #1d1a18;
-    }
+    color-scheme: dark;
+    --sky: #1c1937;
+    --ink: #ece8f6;
+    --soft: #b3acd0;
+    --gold: #f3d9a4;
+    --line: #dcd2ff24;
+    --bubble: #c8b4ff1f;
+    --glass: #1e1a3e73;
 }
 * { box-sizing: border-box; }
+html, body { height: 100%; }
+html { background: var(--sky); }
 body {
     margin: 0;
-    background: var(--paper);
     color: var(--ink);
-    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
 }
-main { max-width: 860px; margin: 0 auto; padding: 40px 16px 64px; }
-h1 { font-size: 28px; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 4px; }
-.sub { color: var(--soft); margin: 0 0 28px; }
-.controls {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 14px 18px;
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    padding: 18px;
+body::before, body::after, html::after {
+    content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
 }
-label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--soft); }
-select, input[type=number] {
-    font: inherit; color: var(--ink); background: var(--paper);
-    border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+html::after {
+    background:
+        radial-gradient(ellipse 45% 40% at 82% 8%, #966e8c59, transparent 70%),
+        radial-gradient(ellipse 40% 35% at 12% 88%, #8c5a5a38, transparent 70%),
+        radial-gradient(ellipse 60% 50% at 50% 45%, #46408240, transparent 75%),
+        linear-gradient(#2c2856, #26224a 45%, #1c1937);
+    z-index: -2;
 }
-input[type=range] { accent-color: var(--accent); }
-.value { color: var(--ink); font-weight: 600; }
-.check { flex-direction: row; align-items: center; gap: 8px; }
-.buttons { display: flex; gap: 10px; align-items: end; }
-button {
-    font: inherit; font-weight: 600; border-radius: 999px; padding: 9px 20px; cursor: pointer;
-    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+body::before { background: var(--stars-gold) 0 0 / 683px; animation: twinkle 5.3s ease-in-out infinite alternate; }
+body::after { background: var(--stars-lilac) 0 0 / 811px; animation: twinkle 6.2s ease-in-out -1.4s infinite alternate; }
+@keyframes twinkle { from { opacity: .25; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+    body::before, body::after { animation: none; opacity: .7; }
 }
-button.quiet { background: transparent; color: var(--accent); }
-button:disabled { opacity: 0.45; cursor: default; }
-#out {
-    margin-top: 22px; min-height: 320px; white-space: pre-wrap; overflow-wrap: anywhere;
-    background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px;
-    font: 18px/1.65 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+body.chat .write-only, body:not(.chat) .chat-only { display: none !important; }
+main {
+    max-width: 720px; height: 100%; margin: 0 auto; padding: 0 16px;
+    display: flex; flex-direction: column;
 }
-#out .tag { color: var(--accent); font-weight: 600; }
-.stats { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; color: var(--soft); font-size: 14px; }
-.stats b { color: var(--ink); font-weight: 600; }
-.files { margin-top: 26px; font-size: 14px; color: var(--soft); }
-.files summary { cursor: pointer; }
-.files label { margin-top: 10px; }
-#status { margin-top: 10px; font-size: 14px; color: var(--soft); }
+header { display: flex; align-items: center; justify-content: space-between; padding: 18px 0 10px; }
+h1 { font: 400 26px/1.2 "Yuji Syuku", Georgia, serif; color: var(--gold); margin: 0; letter-spacing: 0.01em; }
+button { font: inherit; color: inherit; cursor: pointer; }
+button:disabled { opacity: 0.4; cursor: default; }
+.text-button { background: none; border: 0; padding: 4px 0; color: var(--soft); font-size: 14px; }
+.text-button:hover:not(:disabled) { color: var(--ink); }
+#log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 22px; padding: 18px 0; }
+.msg { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.you { align-self: flex-end; max-width: 80%; background: var(--bubble); padding: 9px 15px; border-radius: 18px; }
+.msg.model { align-self: stretch; }
+.msg .tag { color: var(--soft); font-weight: 600; }
+#status { color: var(--soft); margin: auto; text-align: center; }
+#status:empty { display: none; }
+.composer {
+    display: flex; align-items: center; gap: 8px;
+    border: 1px solid var(--line); background: var(--glass); border-radius: 26px; padding: 6px 6px 6px 18px;
+    backdrop-filter: blur(10px);
+}
+.composer:focus-within { border-color: #f3d9a466; }
+.composer option { background: var(--sky); }
+.composer input, .composer select {
+    flex: 1; min-width: 0; font: inherit; color: var(--ink); background: transparent; border: 0; outline: none;
+}
+.round {
+    flex: none; width: 36px; height: 36px; border-radius: 50%; border: 0; padding: 0;
+    display: grid; place-items: center; background: var(--gold); color: var(--sky);
+}
+.round svg { width: 16px; height: 16px; }
+.round .stop-icon, .round.running .go-icon { display: none; }
+.round.running .stop-icon { display: block; }
+.info { color: var(--soft); font-size: 13px; text-align: center; padding: 10px 0 4px; }
+.info span { display: block; }
+details { color: var(--soft); font-size: 13px; padding: 0 0 18px; text-align: center; }
+summary { cursor: pointer; list-style: none; display: inline; }
+summary::-webkit-details-marker { display: none; }
+summary:hover { color: var(--ink); }
+.settings {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px 16px;
+    text-align: left; margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 14px;
+    background: var(--glass); backdrop-filter: blur(10px);
+}
+.settings label { display: flex; flex-direction: column; gap: 4px; }
+.settings label.check { flex-direction: row; align-items: center; gap: 8px; }
+.settings label.wide { grid-column: 1 / -1; }
+.settings input[type=number] {
+    font: inherit; color: var(--ink); background: #0e0c2059;
+    border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
+}
+.settings input[type=range] { accent-color: var(--gold); }
 </style>
 </head>
 <body>
 <main>
-    <h1>Tiny GPT, running in your browser</h1>
-    <p class="sub">A small transformer, decoding one token at a time with a KV cache.
-        Everything runs locally in WebAssembly.</p>
+    <header>
+        <h1>babyCUDA</h1>
+        <button id="newchat" class="text-button chat-only" disabled>New chat</button>
+    </header>
 
-    <div class="controls">
-        <label>Start from
-            <select id="tag"></select>
-        </label>
-        <label>Temperature <span class="value" id="tempv">0.8</span>
-            <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.8">
-        </label>
-        <label>Top k
-            <input id="topk" type="number" min="0" max="5000" value="40">
-        </label>
-        <label>New tokens
-            <input id="count" type="number" min="1" max="5000" value="300">
-        </label>
-        <label>Seed
-            <input id="seed" type="number" min="0" value="1">
-        </label>
-        <label class="check"><input id="keep" type="checkbox"> keep going past the next tag</label>
-        <div class="buttons">
-            <button id="go" disabled>Generate</button>
-            <button id="stop" class="quiet" disabled>Stop</button>
+    <div id="log"><div id="status">Loading the model…</div></div>
+
+    <form id="ask" class="composer">
+        <input id="msg" class="chat-only" type="text" autocomplete="off" placeholder="Message" aria-label="Message" disabled>
+        <select id="tag" class="write-only" aria-label="Start from"></select>
+        <button id="go" class="round" type="submit" aria-label="Send" disabled>
+            <svg class="go-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>
+            <svg class="stop-icon" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>
+        </button>
+    </form>
+
+    <div class="info"><span id="model"></span> <span id="speed"></span></div>
+
+    <details>
+        <summary>Settings</summary>
+        <div class="settings">
+            <label>Temperature <span id="tempv">0.8</span>
+                <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.8">
+            </label>
+            <label>Top k
+                <input id="topk" type="number" min="0" max="5000" value="40">
+            </label>
+            <label><span class="chat-only">Longest answer, in tokens</span><span class="write-only">Tokens to write</span>
+                <input id="count" type="number" min="1" max="5000" value="300">
+            </label>
+            <label>Seed
+                <input id="seed" type="number" min="0" value="1">
+            </label>
+            <label class="check wide write-only"><input id="keep" type="checkbox"> Keep going past the next tag</label>
+            <label class="wide">Weights (weights.bin, fp16 or fp32)
+                <input id="wfile" type="file">
+            </label>
+            <label class="wide">Tokenizer (tokenizer.bpe)
+                <input id="tfile" type="file">
+            </label>
         </div>
-    </div>
-
-    <div id="out"></div>
-    <div class="stats">
-        <span>tokens <b id="ntok">0</b></span>
-        <span>speed <b id="speed">-</b></span>
-        <span>cache refills <b id="refills">0</b></span>
-        <span>model <b id="model">loading</b></span>
-    </div>
-    <div id="status">Loading forward.wasm, weights16.bin and tokenizer.bpe ...</div>
-
-    <details class="files">
-        <summary>Use other files</summary>
-        <label>weights.bin (fp16 or fp32, from reference/export.py or train_fast)
-            <input id="wfile" type="file">
-        </label>
-        <label>tokenizer.bpe
-            <input id="tfile" type="file">
-        </label>
     </details>
 </main>
 
-<script>
-"use strict";
-const $ = (id) => document.getElementById(id);
-let wasm = null, mem = null, cfg = null, vocab = null, specials = [], firstSpecial = 0;
-let running = false;
+<script type="module">
+import { parseTokenizer, encodePlain } from "./bpe.mjs";
 
-// ---- tokenizer.bpe: merges build the byte strings, specials come after them
-function parseTokenizer(text) {
-    const lines = text.split("\n");
-    if (!/^bpe v[12]\b/.test(lines[0])) throw new Error("not a tokenizer.bpe file");
-    const merges = parseInt(lines[1].split(" ")[1], 10);
-    const v = [];
-    for (let b = 0; b < 256; b++) v.push(new Uint8Array([b]));
-    for (let i = 0; i < merges; i++) {
-        const [a, b] = lines[2 + i].split(" ").map(Number);
-        const joined = new Uint8Array(v[a].length + v[b].length);
-        joined.set(v[a]);
-        joined.set(v[b], v[a].length);
-        v.push(joined);
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+let wasm = null, cfg = null, tok = null, vocab = null, specials = [], firstSpecial = 0;
+let running = false, chat = null, userId = -1, assistantId = -1;
+const frame = () => new Promise((r) => setTimeout(r, 0));
+
+function setStatus(text) {
+    statusEl.textContent = text;
+}
+
+// the sky: gold and lavender star tiles, a few stars with a glow (like github-night-sky's stars.css)
+function starTile(size, color, count, seed) {
+    const rand = rng(seed);
+    let dots = "";
+    for (let k = 0; k < count; k++) {
+        const x = Math.round(rand() * size), y = Math.round(rand() * size);
+        if (rand() < 0.12) dots += `<circle cx='${x}' cy='${y}' r='4' fill='url(#g)' opacity='.6'/>`;
+        dots += `<circle cx='${x}' cy='${y}' r='${[0.6, 0.8, 1, 1.3][Math.floor(rand() * 4)]}' fill='${color}'/>`;
     }
-    const nspec = parseInt(lines[2 + merges].split(" ")[1], 10);
-    const enc = new TextEncoder();
-    const spec = [];
-    for (let k = 0; k < nspec; k++) {
-        const name = lines[3 + merges + k].replace(/\r$/, "");
-        spec.push(name);
-        v.push(enc.encode(name));
-    }
-    return { vocab: v, specials: spec, firstSpecial: 256 + merges };
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='${size}' height='${size}' color='${color}'>` +
+        `<defs><radialGradient id='g'><stop offset='0' stop-color='currentColor'/>` +
+        `<stop offset='1' stop-color='currentColor' stop-opacity='0'/></radialGradient></defs>${dots}</svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
+}
+document.documentElement.style.setProperty("--stars-gold", starTile(683, "#ffe2a0", 28, 7));
+document.documentElement.style.setProperty("--stars-lilac", starTile(811, "#e1dcff", 38, 11));
+
+function clearLog() {
+    for (const m of [...$("log").querySelectorAll(".msg")]) m.remove();
 }
 
 // ---- weights.bin into wasm memory, then load()
@@ -162,24 +188,32 @@ function loadWeights(bytes) {
     const why = ["", "not a weights.bin file", "another weights.bin version", "the sizes do not add up", "out of memory"];
     if (status !== 0) throw new Error("load(): " + (why[status] || status));
     cfg = { V: wasm.config(0), Vp: wasm.config(1), n_ctx: wasm.config(2), L: wasm.config(3), H: wasm.config(4), C: wasm.config(5) };
-    $("model").textContent = `L ${cfg.L}, C ${cfg.C}, context ${cfg.n_ctx}`;
+    const C = cfg.C, params = cfg.Vp * C + cfg.n_ctx * C + cfg.L * (12 * C * C + 13 * C) + 2 * C;
+    $("model").textContent = `${(params / 1e6).toFixed(1)}M parameters, ${cfg.L} layers, ` +
+        `${cfg.n_ctx} tokens of context, running on this computer's CPU.`;
 }
 
+// ---- a tokenizer with <user> and <assistant> tags is the chat model's: the page becomes a chat
 function setTokenizer(text) {
-    const t = parseTokenizer(text);
-    vocab = t.vocab; specials = t.specials; firstSpecial = t.firstSpecial;
-    $("tag").innerHTML = specials.map((s, i) => `<option value="${i}">${s.replace(/[<>]/g, "")}</option>`).join("");
+    tok = parseTokenizer(text);
+    vocab = tok.vocab; specials = tok.specials; firstSpecial = tok.firstSpecial;
+    $("tag").innerHTML = specials.map((s, i) => `<option value="${i}">Start from ${s.replace(/[<>]/g, "")}</option>`).join("");
+    userId = firstSpecial + specials.indexOf("<user>");
+    assistantId = firstSpecial + specials.indexOf("<assistant>");
+    document.body.classList.toggle("chat", userId >= firstSpecial && assistantId >= firstSpecial);
+    newChat();
 }
 
 function ready() {
     const ok = wasm && cfg && vocab;
-    if (ok && vocab.length !== cfg.V) {
-        $("status").textContent = `The tokenizer has ${vocab.length} ids but the model has ${cfg.V}. Pick matching files.`;
-        $("go").disabled = true;
-        return;
-    }
-    $("go").disabled = !ok || running;
-    if (ok) $("status").textContent = "Ready.";
+    const mismatch = ok && vocab.length !== cfg.V;
+    $("go").disabled = !ok || mismatch;
+    $("go").classList.toggle("running", running);
+    $("go").setAttribute("aria-label", running ? "Stop" : document.body.classList.contains("chat") ? "Send" : "Write");
+    $("msg").disabled = $("tag").disabled = !ok || mismatch || running;
+    $("newchat").disabled = !ok || mismatch || running;
+    if (mismatch) setStatus(`The tokenizer has ${vocab.length} ids but the model has ${cfg.V}. Pick matching files in Settings.`);
+    else if (ok && statusEl.textContent.startsWith("Loading")) setStatus("");
 }
 
 // ---- seeded random numbers (mulberry32), so a seed reproduces a sample
@@ -194,15 +228,37 @@ function rng(seed) {
     };
 }
 
+function settings() {
+    return {
+        temp: parseFloat($("temp").value),
+        topk: parseInt($("topk").value, 10) || 0,
+        count: Math.max(1, parseInt($("count").value, 10) || 1),
+    };
+}
+
+function showSpeed(made, t0) {
+    const rate = Math.round(made / ((performance.now() - t0) / 1000));
+    const what = document.body.classList.contains("chat") ? "Last reply" : "Last run";
+    $("speed").textContent = `${what}: ${made} tokens at ${rate} tokens per second.`;
+}
+
+function addMsg(who, text) {
+    const div = document.createElement("div");
+    div.className = `msg ${who}`;
+    div.textContent = text;
+    $("log").appendChild(div);
+    div.scrollIntoView({ block: "end" });
+    return div;
+}
+
+// ---- writing mode (a model without chat tags): continue from a tag
 async function generate() {
     running = true;
-    $("go").disabled = true;
-    $("stop").disabled = false;
-    const out = $("out");
-    out.textContent = "";
+    ready();
+    clearLog();
+    const out = addMsg("model", "");
     const tagId = firstSpecial + parseInt($("tag").value, 10);
-    const temp = parseFloat($("temp").value), topk = parseInt($("topk").value, 10) || 0;
-    const count = Math.max(1, parseInt($("count").value, 10) || 1);
+    const { temp, topk, count } = settings();
     const keep = $("keep").checked;
     const rand = rng(parseInt($("seed").value, 10) || 0);
     const tagSpan = document.createElement("span");
@@ -214,7 +270,7 @@ async function generate() {
     const decoder = new TextDecoder("utf-8", { fatal: false });
 
     const history = [tagId, 10];               // the tag, then "\n", like reference/sample.py
-    let pos = 0, refills = 0, made = 0;
+    let pos = 0, made = 0;
     const feed = (token) => { wasm.step(token, pos); pos++; };
     feed(history[0]);
     feed(history[1]);
@@ -222,11 +278,10 @@ async function generate() {
     while (running && made < count) {
         const sliceEnd = performance.now() + 30;       // give the page a frame every 30 ms
         while (running && made < count && performance.now() < sliceEnd) {
-            const next = wasm.sample(temp, topk, rand());
+            const next = wasm.sample(temp, topk, rand(), 0);
             made++;
             history.push(next);
             if (next >= firstSpecial && !keep) {
-                textNode.appendData(`\n[the model started a new chunk: ${specials[next - firstSpecial]}]`);
                 running = false;
                 break;
             }
@@ -235,34 +290,112 @@ async function generate() {
                 const kept = history.slice(history.length - cfg.n_ctx / 2);
                 pos = 0;
                 kept.forEach(feed);
-                refills++;
             } else {
                 feed(next);
             }
         }
-        $("ntok").textContent = made;
-        $("refills").textContent = refills;
-        $("speed").textContent = `${Math.round(made / ((performance.now() - t0) / 1000))} tok/s`;
-        await new Promise((r) => setTimeout(r, 0));
+        showSpeed(made, t0);
+        await frame();
     }
     textNode.appendData(decoder.decode());
     running = false;
-    $("stop").disabled = true;
     ready();
 }
 
+// ---- chat: the conversation stays in the cache, like ./build/generate --chat
+function newChat() {
+    chat = { history: [], pos: 0, rand: rng(parseInt($("seed").value, 10) || 0) };
+    clearLog();
+    $("speed").textContent = "";
+}
+
+function feedChat(token) {
+    chat.history.push(token);
+    if (chat.pos === cfg.n_ctx) {                        // full: the last half again, this token included
+        const kept = chat.history.slice(chat.history.length - cfg.n_ctx / 2);
+        chat.pos = 0;
+        for (const k of kept) wasm.step(k, chat.pos++);
+    } else {
+        wasm.step(token, chat.pos++);
+    }
+}
+
+// what cuda/generate.cu does to a typed line before it goes in
+function cleanLine(line) {
+    let out = line.replace(/[\r\x1e]/g, "").replace(/[ \t]+$/, "");
+    if (/^<[a-z_]+>$/.test(out)) out = " " + out;     // a line like "<div>" would become a tag: keep it text
+    return out;
+}
+
+async function send() {
+    const line = cleanLine($("msg").value);
+    if (!line) return;
+    $("msg").value = "";
+    running = true;
+    ready();
+    addMsg("you", line);
+    const reply = addMsg("model", "");
+    const { temp, topk, count } = settings();
+
+    let ids = [userId, ...encodePlain(tok, "\n" + line + "\n"), assistantId, ...encodePlain(tok, "\n")];
+    const longest = 2 * cfg.n_ctx;                       // a longer message keeps its last part
+    if (ids.length - 1 > longest) ids = [userId, 10, ...ids.slice(ids.length - longest)];
+    for (let k = 0; k < ids.length; k++) {
+        feedChat(ids[k]);
+        if (k % 32 === 31) await frame();
+    }
+
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    let text = "", made = 0, ended = false;
+    const t0 = performance.now();
+    while (running && made < count) {
+        const sliceEnd = performance.now() + 30;
+        while (running && made < count && performance.now() < sliceEnd) {
+            const next = wasm.sample(temp, topk, chat.rand(), made === 0 ? firstSpecial : 0);
+            made++;
+            if (next >= firstSpecial) {                  // a tag ends the answer; <user> goes in with the next message
+                ended = true;
+                break;
+            }
+            text += decoder.decode(vocab[next], { stream: true });
+            feedChat(next);
+        }
+        if (ended) break;
+        reply.textContent = text.trimEnd();
+        reply.scrollIntoView({ block: "end" });
+        showSpeed(made, t0);
+        await frame();
+    }
+    if (!ended) feedChat(10);                            // ran out or stopped: "\n", then <user> next time
+    text += decoder.decode();
+    reply.textContent = text.trimEnd();
+    showSpeed(made, t0);
+    running = false;
+    ready();
+    $("msg").focus();
+}
+
 $("temp").addEventListener("input", () => ($("tempv").textContent = $("temp").value));
-$("go").addEventListener("click", () => generate().catch((e) => ($("status").textContent = e.message)));
-$("stop").addEventListener("click", () => (running = false));
+$("newchat").addEventListener("click", () => { newChat(); $("msg").focus(); });
+$("ask").addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (running) {
+        running = false;
+        return;
+    }
+    const job = document.body.classList.contains("chat") ? send() : generate();
+    job.catch((err) => setStatus(err.message));
+});
 $("wfile").addEventListener("change", async (e) => {
     try {
         const f = e.target.files[0];
         const inst = await WebAssembly.instantiateStreaming(fetch("forward.wasm"));   // fresh memory for the new model
         wasm = inst.instance.exports;
         loadWeights(await f.arrayBuffer());
+        newChat();
         ready();
     } catch (err) {
-        $("status").textContent = err.message;
+        setStatus(err.message);
     }
 });
 $("tfile").addEventListener("change", async (e) => {
@@ -270,25 +403,24 @@ $("tfile").addEventListener("change", async (e) => {
         setTokenizer(await e.target.files[0].text());
         ready();
     } catch (err) {
-        $("status").textContent = err.message;
+        setStatus(err.message);
     }
 });
 
-(async () => {
-    try {
-        const [inst, wbytes, ttext] = await Promise.all([
-            WebAssembly.instantiateStreaming(fetch("forward.wasm")),
-            fetch("weights16.bin").then((r) => { if (!r.ok) throw new Error("no weights16.bin next to this page"); return r.arrayBuffer(); }),
-            fetch("tokenizer.bpe").then((r) => { if (!r.ok) throw new Error("no tokenizer.bpe next to this page"); return r.text(); }),
-        ]);
-        wasm = inst.instance.exports;
-        loadWeights(wbytes);
-        setTokenizer(ttext);
-        ready();
-    } catch (err) {
-        $("status").textContent = err.message + ". Pick the files below, or see the README for how to make them.";
-    }
-})();
+try {
+    const [inst, wbytes, ttext] = await Promise.all([
+        WebAssembly.instantiateStreaming(fetch("forward.wasm")),
+        fetch("weights16.bin").then((r) => { if (!r.ok) throw new Error("No weights16.bin next to this page"); return r.arrayBuffer(); }),
+        fetch("tokenizer.bpe").then((r) => { if (!r.ok) throw new Error("No tokenizer.bpe next to this page"); return r.text(); }),
+    ]);
+    wasm = inst.instance.exports;
+    loadWeights(wbytes);
+    setTokenizer(ttext);
+    ready();
+} catch (err) {
+    setStatus(err.message + ". Pick the files in Settings, or see the README for how to make them.");
+    ready();
+}
 </script>
 </body>
 </html>

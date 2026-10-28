@@ -406,10 +406,11 @@ __attribute__((export_name("step"))) float *step(int token, int pos)
 
 // The draw of cuda/kernels/decode.cu on the last logits: temperature 0 is the
 // argmax; else l / temperature, keep the top_k largest (ties at the k-th too),
-// softmax, and the first id whose running sum passes u * total.
-__attribute__((export_name("sample"))) int sample(float temperature, int top_k, float u)
+// softmax, and the first id whose running sum passes u * total. ban_from > 0
+// draws from ids 0 .. ban_from - 1 only (a chat answer's first token).
+__attribute__((export_name("sample"))) int sample(float temperature, int top_k, float u, int ban_from)
 {
-    int V = m.V;
+    int V = ban_from > 0 && ban_from < m.V ? ban_from : m.V;
     const float *l = m.logits;
     if (temperature <= 0.0f)
     {

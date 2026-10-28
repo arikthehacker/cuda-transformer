@@ -95,5 +95,13 @@ let lastKept = 0;
 last.forEach((v, j) => { if (v >= kth) lastKept = j; });
 const topkOk = pickLow === firstKept && pickHigh === lastKept;
 console.log(`top_k 40 keeps the 40 largest (u = 0 picks id ${pickLow}, u = 1 picks id ${pickHigh}): ${topkOk ? "ok" : "FAILED"}`);
+
+// ban_from: the draw only sees the ids below it, greedy and sampled
+const top = last.indexOf(sorted[0]);
+let below = 0;
+for (let j = 1; j < top; j++) if (last[j] > last[below]) below = j;
+let banOk = top > 0 && w.sample(0, 0, 0.5, top) === below;
+for (let u = 0; u < 1; u += 0.05) banOk = banOk && w.sample(1.0, 40, u, top) < top;
+console.log(`ban_from at the argmax (${top}) gives the best id below it (${below}) and never a banned one: ${banOk ? "ok" : "FAILED"}`);
 console.log(`${T} tokens in ${ms.toFixed(1)} ms here`);
-process.exit(ok && greedyOk && topkOk ? 0 : 1);
+process.exit(ok && greedyOk && topkOk && banOk ? 0 : 1);
