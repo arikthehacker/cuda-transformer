@@ -12,7 +12,8 @@
 //  5. chat: tokens fed one decode step each give what a prefill gives, an
 //     answer stops at a tag and leaves <user> in place, and a conversation
 //     kept in the cache over many turns (past rollovers and a history
-//     compaction) answers exactly like the same conversation fed at once
+//     compaction) answers exactly like the same conversation fed at once,
+//     and an answer never starts with a tag
 // The weights are the dump's (any weights work: nothing here needs training).
 
 #include <algorithm>
@@ -366,6 +367,38 @@ static void chat_checks(Generator &gen)
     check(length > 4 * T + MAXN + 2, "the conversation (" + to_string(length) + " tokens) outgrew the history " +
                                          "buffer, so it was compacted, and rolled the cache over");
     check(at_once == last_answer, "turn by turn in the cache answers exactly like the whole conversation at once");
+
+    // e. an answer's first token is never a tag, in either mode, greedy or sampled
+    gen.chat_start(MAXN, 6);
+    gen.chat_feed(p);
+    int t0 = gen.chat_answer(1, greedy, V, next, Generator::Mode::Cached, quiet)[0];
+    check(t0 > 0, "the greedy first token (" + to_string(t0) + ") leaves ids below it to fall back on");
+    for (Generator::Mode mode : {Generator::Mode::Cached, Generator::Mode::CachedGraph})
+    {
+        gen.chat_start(MAXN, 6);
+        gen.chat_feed(p);
+        vector<int> a = gen.chat_answer(1, greedy, t0, next, mode, quiet);
+        vector<float> l = gen.logits.download();
+        int best = static_cast<int>(max_element(l.begin(), l.begin() + t0) - l.begin());
+        check(a.size() == 1 && a[0] == best, string(mode == Generator::Mode::Cached ? "plain" : "graph") +
+                                                 ": with stop_from at the greedy first token, the answer starts "
+                                                 "with the best id below it (" + to_string(a[0]) + ", want " +
+                                                 to_string(best) + ")");
+    }
+    bool sampled_ok = true;
+    for (int seed = 0; seed < 20; seed++)
+    {
+        gen.chat_start(MAXN, 100 + seed);
+        gen.chat_feed(p);
+        vector<int> a = gen.chat_answer(1, {0.8f, 40}, t0, next, Generator::Mode::CachedGraph, quiet);
+        sampled_ok = sampled_ok && a[0] < t0;
+    }
+    check(sampled_ok, "sampled at temperature 0.8, 20 answers never start with a token >= stop_from");
+    gen.chat_start(MAXN, 7);
+    gen.chat_feed(p);
+    vector<int> two = gen.chat_answer(MAXN, greedy, 1, next, Generator::Mode::CachedGraph, quiet);
+    check(two.size() >= 2 && two[0] == 0 && two.back() >= 1,
+          "only the first token is held back: with every id but 0 a tag, the answer starts with 0 and ends at a tag");
 }
 
 int main(int argc, char *argv[])

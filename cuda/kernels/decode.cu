@@ -295,6 +295,10 @@ __global__ void __launch_bounds__(SAMPLE_THREADS) sample_kernel(DecodeState *st,
     int tid = threadIdx.x;
     float temp = sc.temperature;
     int chosen;
+    if (st->ban_from > 0 && st->sampled == 0)
+    {
+        V = min(V, st->ban_from);
+    }
 
     if (temp <= 0.0f)
     {

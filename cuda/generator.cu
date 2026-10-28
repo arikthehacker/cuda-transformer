@@ -327,6 +327,7 @@ vector<int> Generator::chat_answer(int max_new, SampleConfig sc, int stop_from, 
     CUDA_CHECK(cudaMemcpyAsync(&st, state.ptr, sizeof(st), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     st.sampled = 0;
+    st.ban_from = stop_from;
     CUDA_CHECK(cudaMemcpyAsync(state.ptr, &st, sizeof(st), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
 

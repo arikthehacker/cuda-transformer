@@ -67,7 +67,8 @@ struct Generator
     // becomes the pending token. Rolls the cache over like generate().
     void chat_feed(const std::vector<int> &tokens);
     // Samples until the model writes a token >= stop_from (any tag) or max_new
-    // tokens came. on_token sees each token as it arrives, the tag included.
+    // tokens came. The first token is never one of them (stop_from > 0), so
+    // an answer is never empty. on_token sees each token as it arrives, the tag included.
     // Afterwards `next` (the <user> tag) is the pending token: a different
     // tag is swapped for it, and an answer that ran out gets "\n" + next fed
     // after it. Returns the answer, ending with the tag when one came.

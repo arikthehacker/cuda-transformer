@@ -22,6 +22,7 @@ struct DecodeState
     int pos;            // its position, = how many tokens the cache holds
     int n;              // tokens in the history so far (prompt + sampled)
     int sampled;        // tokens sampled so far (indexes the random numbers)
+    int ban_from;       // while sampled is 0, ids >= ban_from are never drawn (0 = no ban)
 };
 
 struct SampleConfig
@@ -62,6 +63,8 @@ void fill_cache(floatX *k_cache, floatX *v_cache, const floatX *qkv, int t, int 
 //   else: l / temperature, keep the top_k largest (ties at the k-th value
 //   too, like torch.topk + masked_fill), softmax, then the smallest j whose
 //   running sum of probabilities (in id order) passes rand * total.
+// While st->sampled is 0 and st->ban_from > 0, the draw is over ids
+// 0 .. ban_from - 1 only, so a chat answer cannot start with a tag.
 // Then the state moves on: the new token is history[st->n], n and sampled
 // go up by one, pos becomes set_pos (after a prefill) or pos + 1.
 // TL is float (the decode logits) or floatX (the prefill's full forward logits).
