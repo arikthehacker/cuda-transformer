@@ -16,7 +16,9 @@ can add your own writing to it.
 
 A second, bigger model is for chatting. It learns English from FineWeb-Edu, a large set
 of educational web pages, and then learns to answer from the conversations in
-smol-smoltalk. `make chat` talks to it in the terminal.
+smol-smoltalk. At its size the fast version trains about 10% faster than PyTorch.
+`make chat` talks to it in the terminal, and babyCUDA, the browser demo, chats with it
+too.
 
 ## quickstart
 
@@ -279,6 +281,7 @@ and Node.js:
 ```
 sudo apt-get install -y clang lld nodejs python3-numpy
 make test-demo
+make demo
 python -m reference.export --fp16 --out demo/weights16.bin
 make serve-demo
 ```
@@ -297,7 +300,13 @@ wasm model: L 2 H 4 C 64 n_ctx 64 V 4098 Vp 4160
 logits at every position vs the dump: worst 4.47e-7 at pos 11 (tol 0.00001) ok
 greedy sample() is the argmax: ok
 top_k 40 keeps the 40 largest (u = 0 picks id 282, u = 1 picks id 3931): ok
-64 tokens in 19.5 ms here
+ban_from at the argmax (584) gives the best id below it (282) and never a banned one: ok
+64 tokens in 19.0 ms here
+node demo/test_bpe.mjs build/bpe data/tokenizer.bpe data/corpus_val.txt
+ok     "Hello! What is your name?" (9 ids)
+...
+ok     the first 297,772 characters of data/corpus_val.txt: 81,166 ids
+bpe.mjs encodes like the C++ tokenizer
 ```
 
 ## your own writing
@@ -382,10 +391,13 @@ python.exe prepare_chat.py --max-chars 20000000    # a 20 MB test run first
 make chat-data          # FineWeb-Edu and smol-smoltalk -> data/chat/*.txt
 make chat-tokens        # tokenizer, token files, SFT targets, starting weights
 make test-chat          # masked loss, checkpoints, chat in the KV cache
+make chat-compare       # PyTorch and train_fast on the same 500 batches
 make sweep              # 7 short runs pick the learning rate and beta2
 make chat-pretrain      # 122,000 steps (1B tokens) on web text
 make chat-sft           # 26,000 steps on the answers of the conversations
 make chat               # talk to it
+make demo-chat          # put it in the browser demo
+make serve-demo         # then open http://localhost:8000
 ```
 
 expected output (the lines of `make chat-tokens` that check the tokenizer, the times
@@ -436,6 +448,11 @@ to 1e-4, with beta2 0.99. Published fits of the best learning rate against model
 had put it between 2e-3 and 1e-2 for models of 20M to 60M parameters, which is why the
 sweep went up to 6e-3, but for this model and batch size it came out lower.
 
+`make chat-compare` trains PyTorch's fast mode and `train_fast` for 500 steps at the chat
+size, from the same starting weights and on the same batches. Both reach a val loss of
+6.0320 at step 500, and `train_fast` runs at 91,700 tokens per second against PyTorch's
+83,000, about 10% faster. On the first model the lead is about 7%.
+
 `make chat-pretrain` trains on batches of 16 x 512 tokens, so its 122,000 steps cover
 the whole 1B token set, which took 3 hours and 7 minutes on the RTX 2080. The learning
 rate warms up over 2,000 steps, stays flat, and falls over the last 20% of the run
@@ -467,7 +484,10 @@ empty line ends the conversation. The whole conversation stays in the KV cache, 
 each message only runs its own tokens through the model. The answer prints as it is
 written, and after each one comes a line holding only `\x1e`, the ASCII record
 separator, so a program reading the output can tell where an answer ends. The prompt
-and everything else go to stderr.
+and everything else go to stderr. An answer's first token is never a tag, so the model
+cannot end an answer before it starts. Without that rule, a one-word message such as a
+name could get an empty answer, and the model then copied the empty answers for every
+message after it.
 
 As the first message of a `make chat` conversation, "What is the capital of France?"
 gets "The capital of France is Paris." The model explains photosynthesis in paragraphs
@@ -1146,7 +1166,13 @@ dump in Node.js.
 
 `make demo-chat` puts the chat model in the page instead. Its weights are about 68 MB as
 fp16 and 136 MB once widened, against 25 MB for the first model, so the page takes
-longer to load them, and each token reads almost three times as many weights.
+longer to load them, and each token reads almost three times as many weights. When the
+tokenizer has `<user>` and `<assistant>` tags, the page becomes babyCUDA, a chat that
+works like `make chat`, at about 110 tokens per second on the same desktop CPU. Each message is
+encoded in the page by `demo/bpe.mjs`, which has the same pretokenizer and merges as the
+C++ tokenizer. `demo/test_bpe.mjs` checks that the two give the same ids for test strings
+with contractions, numbers, curly quotes and tags, and for 300 KB of real text, and
+`make test-demo` and `make demo-chat` run it.
 
 ### chat model
 
@@ -1313,6 +1339,13 @@ next message. When the cache fills, it keeps the last half, the same as `generat
 `test_generate` checks that a conversation kept in the cache over 8 turns, past cache
 rollovers, answers exactly like the same conversation fed in all at once.
 
+The first token of an answer is drawn with the tags left out. `DecodeState`, the small
+struct in GPU memory that holds the newest token, its position and how many tokens have
+been sampled (`sampled`), also holds a `ban_from` id. While `sampled` is still 0, the
+sampling kernel only looks at the ids below it. The value lives in GPU memory next to the token and its position, so the
+captured CUDA Graph reads it on every replay without being captured again. The browser
+demo passes the same limit to its `sample()`.
+
 <!-- results start: bench/results.py writes everything up to the end marker -->
 ## results
 
@@ -1378,6 +1411,16 @@ Tokens per second for one sample, prompt and every cache rollover included.
 | KV cache + CUDA Graph | 3,259 | 153.4 |
 | KV cache, plain launches | 2,981 | 167.7 |
 | no cache (full forward per token) | 734 | 681.1 |
+
+### loss curves at the chat size
+
+The same comparison for the chat model, 500 steps from data/chat/init.bin (make chat-compare).
+
+![loss curves of PyTorch fast mode and train_fast](bench/curves_chat.svg)
+
+- PyTorch fast: val 6.0320 at step 500
+- CUDA (train_fast): val 6.0320 at step 500
+- difference at step 500: +0.00% (the bar is about 1%)
 
 ### learning rate sweep
 
