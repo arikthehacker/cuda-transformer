@@ -384,7 +384,7 @@ make chat-tokens        # tokenizer, token files, SFT targets, starting weights
 make test-chat          # masked loss, checkpoints, chat in the KV cache
 make sweep              # 7 short runs pick the learning rate and beta2
 make chat-pretrain      # 122,000 steps (1B tokens) on web text
-make chat-sft           # 6,000 steps on the answers of the conversations
+make chat-sft           # 26,000 steps on the answers of the conversations
 make chat               # talk to it
 ```
 
@@ -419,28 +419,40 @@ same numbers PyTorch would.
 
 `make sweep` runs 7 pretraining runs of 100M tokens each, on exactly the same batches:
 learning rates 6e-4, 2e-3 and 6e-3, each with beta2 0.95 and 0.99, and the 6e-4 and
-0.95 run a second time. The learning rates are about 3 times apart because scaling fits
-for models of 20M to 60M parameters put the best AdamW learning rate between 2e-3 and
-1e-2, so 6e-4 is probably too low. Two runs of the same settings differ only by the order of the
+0.95 run a second time. Two runs of the same settings differ only by the order of the
 GPU's atomic adds, so the gap between them is the noise floor, and anything smaller than
-about twice that is a tie. The table goes to `bench/results_sweep.md`, and the winner's
-numbers go to `make chat-pretrain LR=... MIN_LR=... BETA2=...`.
+about twice that is a tie. The table goes to `bench/results_sweep.md` and the results
+section.
+
+Each run is scored in bits per byte on the validation text, the loss per byte of text
+instead of per token, so it does not depend on the tokenizer. Beta2 0.99 beat 0.95 at
+every learning rate, by 0.023 bits per byte at 6e-4, 0.028 at 2e-3 and 0.042 at 6e-3, at
+least 25 times the noise floor. With beta2 0.99, 6e-4 and 2e-3 tied and 6e-3 was 0.023
+worse. The 6e-4 run was ahead of the 2e-3 run for as long as the learning rate stayed
+flat, and 2e-3 caught up in the last 20%, where it falls. A parabola through the three,
+against the log of the learning rate, puts the best one near 1.15e-3. Longer runs tend to
+do best with a lower learning rate than short ones, so the Makefile uses 1e-3, falling
+to 1e-4, with beta2 0.99. Published fits of the best learning rate against model size
+had put it between 2e-3 and 1e-2 for models of 20M to 60M parameters, which is why the
+sweep went up to 6e-3, but for this model and batch size it came out lower.
 
 `make chat-pretrain` trains on batches of 16 x 512 tokens, so its 122,000 steps cover
-the whole 1B token set, about 3.5 hours at the 82,000 tokens per second a short test
-run measured. The learning rate warms up over 2,000 steps, stays flat, and falls over
-the last 20% of the run (WSD). A checkpoint goes to `data/chat/pre/ckpt.bin` after every eval, and if the
-computer stops, `make chat-pretrain RESUME=1` carries on from the last one with the
-same batches and settings. If the PC shuts down under the load, `nvidia-smi -pl 180`
+the whole 1B token set, which took 3 hours and 7 minutes on the RTX 2080. The learning
+rate warms up over 2,000 steps, stays flat, and falls over the last 20% of the run
+(WSD). Over the last 24,000 flat steps, bits per byte fell by 0.006, and over the 24,400
+steps where the learning rate falls, by 0.115. A checkpoint goes to
+`data/chat/pre/ckpt.bin` after every eval, and if the computer stops,
+`make chat-pretrain RESUME=1` carries on from the last one with the same batches and
+settings. If the PC shuts down under the load, `nvidia-smi -pl 180`
 in an administrator terminal on Windows lowers the card's power limit until the next
 restart.
 
 `make chat-sft` starts from the pretrained weights with a fresh optimizer, a learning
-rate of 1e-4 instead of 6e-4 and 100 warmup steps. Every batch row starts at the
-beginning of a conversation, and the loss counts only the answers. 412,948 of the
-460,083 conversations have an answer that fits in 512 tokens. 6,000 steps draw 96,000
-of them, and `SFT_STEPS=26000` draws each one once on average. `make chat-results` and then `make results` put both runs into the results
-section.
+rate of 1e-4 instead of 1e-3 and 100 warmup steps. Every batch row starts at the
+beginning of a conversation, and the loss counts only the answers. 411,012 of the
+460,083 conversations have an answer that fits in 512 tokens, and the 26,000 steps draw
+416,000 rows, about one of each, in 41 minutes. `SFT_STEPS=6000` is a 10 minute run.
+`make chat-results` and then `make results` put both runs into the results section.
 
 A WSD run that is flat in the middle can be cut short at any point and given its own
 decay. `KEEP=97600,195200` keeps the checkpoints of those steps as `ckpt_<step>.bin`,
@@ -456,6 +468,14 @@ each message only runs its own tokens through the model. The answer prints as it
 written, and after each one comes a line holding only `\x1e`, the ASCII record
 separator, so a program reading the output can tell where an answer ends. The prompt
 and everything else go to stderr.
+
+As the first message of a `make chat` conversation, "What is the capital of France?"
+gets "The capital of France is Paris." The model explains photosynthesis in paragraphs
+that start right and then mix up the chemistry. Asked for three study tips, it writes a
+numbered list with bold headings, like the answers it trained on, but keeps going past
+three and repeats the same tip. It cannot add. Asked "What is 12 plus 7?", it writes
+"12 + 7 = 2" and then a loop of wrong sums. In a chat of two messages it repeats the
+name the user gave in the first one, but mixes up which of the two is the user.
 
 ## menu
 
@@ -1359,22 +1379,45 @@ Tokens per second for one sample, prompt and every cache rollover included.
 | KV cache, plain launches | 2,981 | 167.7 |
 | no cache (full forward per token) | 734 | 681.1 |
 
+### learning rate sweep
+
+lr x beta2 at the chat size, 100M tokens each, the same batches (bench/sweep_lr.sh, bench/sweep_summary.py).
+
+Every run: 12,200 steps of 16 x 512 tokens (100M tokens), the same batches and init, warmup 2,000, WSD with the last 20% decaying, min lr = lr / 10.
+
+| lr | beta2 | final val loss | final val bpb | bpb vs baseline | first train loss | skipped steps |
+|---|---|---|---|---|---|---|
+| 6e-4 | 0.95 | 3.8869 | 1.3045 | +0.0000 (baseline) | 9.826203 | 1 |
+| 6e-4 | 0.99 | 3.8192 | 1.2818 | -0.0227 | 9.826203 | 0 |
+| 2e-3 | 0.95 | 3.9004 | 1.3090 | +0.0045 | 9.826203 | 1 |
+| 2e-3 | 0.99 | 3.8161 | 1.2807 **best** | -0.0238 | 9.826203 | 1 |
+| 6e-3 | 0.95 | 4.0100 | 1.3458 | +0.0413 | 9.826203 | 2 |
+| 6e-3 | 0.99 | 3.8847 | 1.3037 | -0.0008 tie | 9.826203 | 0 |
+| 6e-4 | 0.95 | 3.8896 | 1.3054 | +0.0009 (A/A: the baseline again) | 9.826203 | 1 |
+
+Noise floor (the two baseline runs): 0.0009 bpb. A difference under about twice that is a tie.
+Every run's first step had the same train loss, so the batches and the init match.
+Best: lr 2e-3, beta2 0.99.
+
 ### chat model
 
 L 8, H 8, C 512, n_ctx 512, 33.9M parameters, batch 16 x 512 tokens. Pretrained on FineWeb-Edu, then fine-tuned on smol-smoltalk (bench/chat_results.py reads both train_fast logs).
 
-not measured yet (`bench/results_chat.md` does not exist)
+| run | steps | tokens | val at start | best val | final val | final val bpb | tok/s | GPU hours | counted per step |
+|---|---|---|---|---|---|---|---|---|---|
+| pretrain (FineWeb-Edu) | 122,000 | 999M | 9.826 | 3.443 (step 122,000) | 3.443 | 1.1554 | 91,408 | 3.04 | 8,192 of 8,192 |
+| SFT (smol-smoltalk, answers only) | 26,000 | 213M | 3.384 | 1.757 (step 26,000) | 1.757 | 0.5799 | 91,222 | 0.65 | 4,798 of 8,192 |
+
+The SFT val loss counts only the answer tokens of smol-smoltalk's test split, so it is not on the same scale as the pretraining val loss. Bits per byte leave the tags out and do not depend on the tokenizer.
 
 <!-- results end -->
 
 ## plan
 
 The data scripts, the tokenizer, the PyTorch reference model, the 32-bit CUDA version,
-the fast version, generation and the chat model's code are written. Next:
+the fast version, generation and the chat model are written, and the chat model is
+trained. Next:
 
-5. **Training the chat model.** The learning rate sweep, then pretraining on
-   FineWeb-Edu with WSD, then fine-tuning on smol-smoltalk, with the numbers in the
-   results section.
 6. **A chat box.** The playground and `gui.py` get a chat box over
    `./build/generate --chat`, which keeps the conversation in the KV cache.
 

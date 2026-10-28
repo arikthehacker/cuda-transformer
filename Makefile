@@ -273,16 +273,16 @@ CHAT_TOK   = $(CHAT)/tokenizer.bpe
 CHAT_TAGS  = <web>,<user>,<assistant>,<system>,<tool>,<code>,<book>
 MASKED     = data/ref/debug_chat_masked.bin
 # B 16 x T 512 = 8,192 tokens a step: 122,000 steps is the 1B token set.
-# SFT: 6,000 steps draws 96k of the 413k conversations whose answer fits in
-# 512 tokens; one draw each is about 26,000.
+# SFT: 26,000 steps draw 416k rows, about one of each of the 411k conversations
+# whose answer fits in 512 tokens. SFT_STEPS=6000 is a 10 minute run.
 CHAT_STEPS ?= 122000
-SFT_STEPS  ?= 6000
+SFT_STEPS  ?= 26000
 # the pretraining schedule: WSD with the last 20% decaying (DECAY_STEPS=0 is the
 # old cosine), lr and beta2 from make sweep, KEEP lists steps whose checkpoints
 # stay as ckpt_<step>.bin for branches (make chat-branch)
-LR          ?= 6e-4
-MIN_LR      ?= 6e-5
-BETA2       ?= 0.95
+LR          ?= 1e-3
+MIN_LR      ?= 1e-4
+BETA2       ?= 0.99
 DECAY_STEPS ?= 24400
 KEEP        ?=
 # make chat-pretrain RESUME=1 (or chat-sft) picks a stopped run up from its last checkpoint
